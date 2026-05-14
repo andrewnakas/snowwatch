@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SnowWatch — live 7-day SNOTEL snow-depth forecasts</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>SnowWatch</h1>
+    <p>Live 7-day ensemble snow-depth forecasts for active NRCS SNOTEL stations. Click a marker.</p>
+    <div class="legend">
+      <span class="dot dot-deep"></span> &gt; 40&nbsp;in pack
+      <span class="dot dot-mid"></span> 10&ndash;40&nbsp;in
+      <span class="dot dot-thin"></span> &lt; 10&nbsp;in / bare
+    </div>
+  </header>
+  <div id="layout">
+    <div id="map"></div>
+    <aside id="panel">
+      <div id="panel-empty">Select a SNOTEL station on the map to load its live snow-depth forecast.</div>
+      <div id="panel-content" style="display:none">
+        <h2 id="station-title">&mdash;</h2>
+        <div id="station-meta" class="meta"></div>
+        <div id="forecast-status" class="status"></div>
+        <div id="forecast-summary"></div>
+        <div id="chart-controls" class="chart-controls">
+          <button id="toggle-members" type="button" class="toggle-btn" aria-pressed="false">Show ensemble members</button>
+          <button id="toggle-band" type="button" class="toggle-btn" aria-pressed="true">Show min/max band</button>
+        </div>
+        <canvas id="chart" width="640" height="320"></canvas>
+        <div id="record-start"></div>
+        <div id="member-table"></div>
+        <details class="mae-explainer">
+          <summary>How the ensemble works</summary>
+          <p>Each member predicts the next 7 days of snow depth, then we anchor every member to today's observed depth and blend them with weights proportional to <code>1 / rolling_MAE</code>. Members with no skill on the last few weeks of holdout data get near-zero weight.</p>
+          <p>Members: <b>persistence_lag1</b> (today's depth held flat), <b>climatology</b> (per-day-of-year mean), <b>snow17_lite</b> (accumulate snowfall below freezing, melt above), <b>nbm_snowfall</b> (NOAA NBM forecast snowfall accumulated on the current pack), <b>ridge_snow</b> (LightGBM on lagged depth + temp/precip windows), <b>chronos_bolt</b> (Amazon Chronos zero-shot foundation model).</p>
+        </details>
+        <button id="refresh-btn" type="button">Force refresh</button>
+      </div>
+    </aside>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

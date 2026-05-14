@@ -1,0 +1,121 @@
+name: Build & deploy GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 */6 * * *"  # rebuild every 6 hours
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: "Bootstrap: drop SW_NO_FETCH so cold caches fill (expensive, run once)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  TOTAL_SHARDS: 8
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies (CPU torch wheel)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+
+      - name: Cache HuggingFace model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-chronos-bolt-small-v1
+
+      - name: Restore per-shard incremental data cache
+        uses: actions/cache@v4
+        with:
+          path: data/cache
+          key: sw-cache-v1-shard-${{ matrix.shard }}-${{ github.run_id }}
+          restore-keys: |
+            sw-cache-v1-shard-${{ matrix.shard }}-
+            sw-cache-v1-shard-
+
+      - name: Refresh SNOTEL station list (asset shard only)
+        if: matrix.shard == 0
+        run: python scripts/fetch_stations.py
+        continue-on-error: true
+
+      - name: Build shard ${{ matrix.shard }}/${{ env.TOTAL_SHARDS }}
+        env:
+          PYTHONUNBUFFERED: "1"
+          SW_NO_FETCH: ${{ github.event.inputs.bootstrap == 'true' && '0' || '0' }}
+          SW_ENABLE_CHRONOS: "1"
+        run: |
+          python scripts/build_static_site.py \
+            --shard-id ${{ matrix.shard }} \
+            --total-shards ${{ env.TOTAL_SHARDS }} \
+            --horizon 7
+
+      - name: Upload shard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-shard-${{ matrix.shard }}
+          path: dist
+          retention-days: 1
+          if-no-files-found: error
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: shard_dists
+          pattern: dist-shard-*
+
+      - name: Merge shards
+        run: python scripts/merge_shards.py --input-root shard_dists
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: merge
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
