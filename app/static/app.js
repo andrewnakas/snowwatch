@@ -93,6 +93,7 @@ function pickDateTicks(xmin, xmax, target = 8) {
 let _chartState = {
   canvas: null, history: [], members: {}, blend: [], showMembers: false, showBand: true,
 };
+let _latestDaily = [];
 
 function drawChart(canvas, history, members, blend, lastObsDate) {
   _chartState.canvas = canvas;
@@ -263,6 +264,184 @@ function _renderChart() {
   }
 }
 
+function _sizeCanvas(c, cssH) {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = c.clientWidth || 640;
+  c.width = Math.round(cssW * dpr);
+  c.height = Math.round(cssH * dpr);
+  c.style.height = cssH + "px";
+  const ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  return { ctx, cssW, cssH };
+}
+
+function drawSnowfallChart(canvas, daily) {
+  if (!canvas) return;
+  const { ctx, cssW, cssH } = _sizeCanvas(canvas, 160);
+  if (!daily || !daily.length) {
+    ctx.fillStyle = "#7c87a8"; ctx.font = "12px Inter, sans-serif";
+    ctx.fillText("no snowfall forecast available", 12, 24); return;
+  }
+  const padL = 44, padR = 12, padT = 12, padB = 28;
+  const plotW = cssW - padL - padR;
+  const plotH = cssH - padT - padB;
+  const values = daily.map(d => Number(d.snowfall_in) || 0);
+  const ymax = Math.max(0.5, ...values) * 1.15;
+
+  ctx.strokeStyle = "#1f2a44"; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i <= 3; i++) {
+    const y = padT + (i / 3) * plotH;
+    ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y);
+  }
+  ctx.stroke();
+  ctx.fillStyle = "#7c87a8"; ctx.font = "11px Inter, sans-serif";
+  for (let i = 0; i <= 3; i++) {
+    const v = ymax - (i / 3) * ymax;
+    ctx.fillText(v.toFixed(1), 4, padT + (i / 3) * plotH + 4);
+  }
+
+  const barW = (plotW / daily.length) * 0.66;
+  const slot = plotW / daily.length;
+  daily.forEach((d, i) => {
+    const v = Number(d.snowfall_in) || 0;
+    const h = (v / ymax) * plotH;
+    const x = padL + i * slot + (slot - barW) / 2;
+    const y = padT + plotH - h;
+    // gradient blue->white based on amount
+    const intensity = Math.min(1, v / 6);
+    const r = Math.round(140 + 100 * intensity);
+    const g = Math.round(197 + 50 * intensity);
+    const b = 255;
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(x, y, barW, h);
+    if (v >= 0.1) {
+      ctx.fillStyle = "#e7ecf3";
+      ctx.font = "10px Inter, sans-serif";
+      const lbl = v.toFixed(1);
+      const lw = ctx.measureText(lbl).width;
+      ctx.fillText(lbl, x + barW / 2 - lw / 2, y - 3);
+    }
+    // date tick
+    ctx.fillStyle = "#7c87a8";
+    ctx.font = "10px Inter, sans-serif";
+    const dd = new Date(Date.parse(d.date));
+    const tickLbl = `${dd.toLocaleString(undefined, { month: "short", timeZone: "UTC" })} ${dd.getUTCDate()}`;
+    const tw = ctx.measureText(tickLbl).width;
+    ctx.fillText(tickLbl, x + barW / 2 - tw / 2, cssH - 8);
+  });
+
+  ctx.fillStyle = "#8ec5ff"; ctx.font = "11px Inter, sans-serif";
+  const total = values.reduce((s, v) => s + v, 0);
+  ctx.fillText(`Σ ${total.toFixed(1)} in over ${daily.length}d`, padL + 6, padT + 12);
+}
+
+function drawTempChart(canvas, daily) {
+  if (!canvas) return;
+  const { ctx, cssW, cssH } = _sizeCanvas(canvas, 180);
+  if (!daily || !daily.length) {
+    ctx.fillStyle = "#7c87a8"; ctx.font = "12px Inter, sans-serif";
+    ctx.fillText("no temperature forecast available", 12, 24); return;
+  }
+  const padL = 44, padR = 12, padT = 14, padB = 28;
+  const plotW = cssW - padL - padR;
+  const plotH = cssH - padT - padB;
+
+  const tmins = daily.map(d => Number(d.tmin_f)).filter(Number.isFinite);
+  const tmaxs = daily.map(d => Number(d.tmax_f)).filter(Number.isFinite);
+  const allT = [...tmins, ...tmaxs];
+  if (!allT.length) {
+    ctx.fillStyle = "#7c87a8"; ctx.font = "12px Inter, sans-serif";
+    ctx.fillText("no temperature forecast available", 12, 24); return;
+  }
+  let ymin = Math.min(...allT), ymax = Math.max(...allT);
+  const pad = Math.max(4, (ymax - ymin) * 0.15);
+  ymin -= pad; ymax += pad;
+  // always show the freeze line
+  ymin = Math.min(ymin, 28); ymax = Math.max(ymax, 36);
+
+  const xs = daily.map((_, i) => padL + (i + 0.5) * (plotW / daily.length));
+  const yAt = v => padT + (1 - (v - ymin) / (ymax - ymin || 1)) * plotH;
+
+  // grid
+  ctx.strokeStyle = "#1f2a44"; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + (i / 4) * plotH;
+    ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y);
+  }
+  ctx.stroke();
+  ctx.fillStyle = "#7c87a8"; ctx.font = "11px Inter, sans-serif";
+  for (let i = 0; i <= 4; i++) {
+    const v = ymax - (i / 4) * (ymax - ymin);
+    ctx.fillText(v.toFixed(0) + "°", 4, padT + (i / 4) * plotH + 4);
+  }
+
+  // freezing-line at 32°F
+  if (ymin < 32 && ymax > 32) {
+    const yF = yAt(32);
+    ctx.strokeStyle = "rgba(140, 197, 255, 0.45)";
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.moveTo(padL, yF); ctx.lineTo(padL + plotW, yF); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#8ec5ff"; ctx.font = "10px Inter, sans-serif";
+    ctx.fillText("32°F", padL + plotW - 30, yF - 3);
+  }
+
+  // tmin/tmax envelope
+  ctx.fillStyle = "rgba(255, 138, 76, 0.18)";
+  ctx.beginPath();
+  daily.forEach((d, i) => {
+    const v = Number(d.tmax_f);
+    if (Number.isFinite(v)) ctx.lineTo(xs[i], yAt(v));
+  });
+  for (let i = daily.length - 1; i >= 0; i--) {
+    const v = Number(daily[i].tmin_f);
+    if (Number.isFinite(v)) ctx.lineTo(xs[i], yAt(v));
+  }
+  ctx.closePath(); ctx.fill();
+
+  function drawLine(field, color, width) {
+    ctx.strokeStyle = color; ctx.lineWidth = width;
+    ctx.beginPath(); let started = false;
+    daily.forEach((d, i) => {
+      const v = Number(d[field]);
+      if (!Number.isFinite(v)) return;
+      const x = xs[i], y = yAt(v);
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+  drawLine("tmax_f", "#ff8a4c", 1.6);
+  drawLine("tmin_f", "#8ec5ff", 1.6);
+  drawLine("tmean_f", "#ffd166", 2.2);
+
+  // point markers + labels for tmean
+  ctx.fillStyle = "#ffd166";
+  daily.forEach((d, i) => {
+    const v = Number(d.tmean_f);
+    if (!Number.isFinite(v)) return;
+    const x = xs[i], y = yAt(v);
+    ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
+  });
+
+  // date ticks
+  ctx.fillStyle = "#7c87a8"; ctx.font = "10px Inter, sans-serif";
+  daily.forEach((d, i) => {
+    const dd = new Date(Date.parse(d.date));
+    const lbl = `${dd.toLocaleString(undefined, { month: "short", timeZone: "UTC" })} ${dd.getUTCDate()}`;
+    const tw = ctx.measureText(lbl).width;
+    ctx.fillText(lbl, xs[i] - tw / 2, cssH - 8);
+  });
+
+  // legend
+  ctx.font = "11px Inter, sans-serif";
+  ctx.fillStyle = "#ff8a4c"; ctx.fillText("— tmax", padL + 6, padT + 12);
+  ctx.fillStyle = "#ffd166"; ctx.fillText("— tmean", padL + 60, padT + 12);
+  ctx.fillStyle = "#8ec5ff"; ctx.fillText("— tmin", padL + 120, padT + 12);
+}
+
 function renderSummary(payload) {
   const el = document.getElementById("forecast-summary");
   const blend = payload.blend || [];
@@ -313,6 +492,9 @@ async function selectStation(station) {
     renderSummary(payload);
     renderMemberTable(payload);
     drawChart(document.getElementById("chart"), payload.history, payload.members, payload.blend, payload.last_observed_date);
+    _latestDaily = payload.daily_forecast || [];
+    drawSnowfallChart(document.getElementById("snowfall-chart"), _latestDaily);
+    drawTempChart(document.getElementById("temp-chart"), _latestDaily);
     document.getElementById("forecast-status").textContent = `issued ${payload.issued_at} · horizon ${payload.horizon_days} d`;
   } catch (e) {
     document.getElementById("forecast-status").textContent = `error: ${e.message}`;
@@ -334,6 +516,12 @@ document.getElementById("toggle-band").addEventListener("click", (ev) => {
 document.getElementById("refresh-btn").addEventListener("click", () => {
   if (currentStation) selectStation(currentStation);
 });
-window.addEventListener("resize", _renderChart);
+window.addEventListener("resize", () => {
+  _renderChart();
+  if (_latestDaily.length) {
+    drawSnowfallChart(document.getElementById("snowfall-chart"), _latestDaily);
+    drawTempChart(document.getElementById("temp-chart"), _latestDaily);
+  }
+});
 
 loadStations();

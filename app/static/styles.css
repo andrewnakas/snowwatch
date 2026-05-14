@@ -32,6 +32,8 @@ canvas { width: 100%; max-width: 100%; background: #131f37; border-radius: 10px;
 .toggle-btn:hover { background: #283456; color: #e7ecf3; }
 .toggle-btn[aria-pressed="true"] { background: #2a3a66; color: #e7ecf3; border-color: #5fa0ff; }
 .record-start { font-size: 12px; color: #8ec5ff; margin: 8px 0 4px; }
+.chart-label { font-size: 11px; color: #aab7d4; margin: 12px 0 4px; letter-spacing: 0.3px; text-transform: uppercase; }
+#snowfall-chart, #temp-chart { height: auto; }
 .mae-explainer { margin-top: 12px; padding: 8px 12px; background: #131f37; border: 1px solid #26314f; border-radius: 8px; font-size: 12px; color: #aab7d4; }
 .mae-explainer summary { cursor: pointer; color: #8ec5ff; font-weight: 600; padding: 2px 0; }
 .mae-explainer summary:hover { color: #b9d8ff; }

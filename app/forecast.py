@@ -378,6 +378,7 @@ class StationForecast:
     last_observed_date: Optional[str]
     last_swe: Optional[float]
     elevation_ft: Optional[float]
+    daily_forecast: List[dict] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
 
@@ -394,6 +395,74 @@ _DECAY_BY_MEMBER = {
 def _to_point_list(start: date, values: List[float]) -> List[dict]:
     return [{"date": (start + timedelta(days=h)).isoformat(), "snow_depth_in": float(v)}
             for h, v in enumerate(values, start=1)]
+
+
+def _c_to_f(t_c):
+    if t_c is None or not np.isfinite(t_c):
+        return None
+    return t_c * 9.0 / 5.0 + 32.0
+
+
+def _build_daily_forecast(
+    start: date, horizon: int, wx_fcst: pd.DataFrame, nbm_fcst: pd.DataFrame,
+) -> List[dict]:
+    """One row per forecast day with the inputs the chart panel renders as
+    bars (snowfall) and a temperature line (tmin/tmean/tmax in F).
+
+    Source priority: NBM (calibrated CONUS) → Open-Meteo blend → null. NBM caps
+    at 11 days, so days 12+ fall through to Open-Meteo (which carries the full
+    horizon anyway).
+    """
+    nbm_by_date: Dict[str, dict] = {}
+    if nbm_fcst is not None and not nbm_fcst.empty:
+        for _, r in nbm_fcst.iterrows():
+            d = r["date"]
+            d = d.isoformat() if hasattr(d, "isoformat") else str(d)
+            nbm_by_date[d] = r.to_dict()
+    wx_by_date: Dict[str, dict] = {}
+    if wx_fcst is not None and not wx_fcst.empty:
+        for _, r in wx_fcst.iterrows():
+            d = r["date"]
+            d = d.isoformat() if hasattr(d, "isoformat") else str(d)
+            wx_by_date[d] = r.to_dict()
+
+    out: List[dict] = []
+    for h in range(1, horizon + 1):
+        d = (start + timedelta(days=h)).isoformat()
+        nb = nbm_by_date.get(d, {})
+        wx = wx_by_date.get(d, {})
+
+        def _pick(*candidates):
+            for c in candidates:
+                if c is None:
+                    continue
+                try:
+                    f = float(c)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(f):
+                    return f
+            return None
+
+        snowfall_cm = _pick(nb.get("nbm_snowfall_sum"), wx.get("snowfall_sum"))
+        precip_mm = _pick(nb.get("nbm_precip_sum"), wx.get("precipitation_sum"))
+        tmean_c = _pick(nb.get("nbm_tmean"), wx.get("temperature_2m_mean"))
+        tmax_c = _pick(nb.get("nbm_tmax"), wx.get("temperature_2m_max"))
+        tmin_c = _pick(nb.get("nbm_tmin"), wx.get("temperature_2m_min"))
+        pop = _pick(nb.get("nbm_pop_mean"))
+        source = "nbm" if d in nbm_by_date else ("openmeteo" if d in wx_by_date else "none")
+
+        out.append({
+            "date": d,
+            "snowfall_in": (snowfall_cm / 2.54) if snowfall_cm is not None else None,
+            "precip_in": (precip_mm / 25.4) if precip_mm is not None else None,
+            "tmean_f": _c_to_f(tmean_c),
+            "tmax_f": _c_to_f(tmax_c),
+            "tmin_f": _c_to_f(tmin_c),
+            "pop_pct": pop,
+            "source": source,
+        })
+    return out
 
 
 def _rolling_validation_mae(
@@ -563,6 +632,8 @@ def forecast_station(
         members_payload[name] = _to_point_list(today, vals[:horizon])
     blend_payload = _to_point_list(today, blend_vals)
 
+    daily_forecast = _build_daily_forecast(today, horizon, wx_fcst, nbm_fcst)
+
     return StationForecast(
         station_id=str(station["id"]),
         triplet=station["triplet"],
@@ -573,6 +644,7 @@ def forecast_station(
         blend=blend_payload,
         weights=weights,
         rolling_mae=rolling_mae,
+        daily_forecast=daily_forecast,
         last_observed=last_depth,
         last_observed_date=last_depth_date.isoformat(),
         last_swe=last_swe,
