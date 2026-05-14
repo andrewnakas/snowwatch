@@ -42,7 +42,7 @@
         <details class="mae-explainer">
           <summary>How the ensemble works</summary>
           <p>Each member predicts the next 7 days of snow depth, then we anchor every member to today's observed depth and blend them with weights proportional to <code>1 / rolling_MAE</code>. Members with no skill on the last few weeks of holdout data get near-zero weight.</p>
-          <p>Members: <b>persistence_lag1</b> (today's depth held flat), <b>climatology</b> (per-day-of-year mean), <b>snow17_lite</b> (accumulate snowfall below freezing, melt above), <b>nbm_snowfall</b> (NOAA NBM forecast snowfall accumulated on the current pack), <b>ridge_snow</b> (LightGBM on lagged depth + temp/precip windows), <b>chronos_bolt</b> (Amazon Chronos zero-shot foundation model).</p>
+          <p>Members: <b>persistence_lag1</b> (today's depth held flat), <b>climatology</b> (per-day-of-year mean), <b>snow17</b> (full Anderson 1976 SNOW-17 conceptual snowpack — temperature-index melt, refreeze, rain-on-snow, density compaction), <b>nbm_snowfall</b> (NOAA NBM forecast snowfall accumulated on the current pack), <b>ridge_snow</b> (LightGBM on lagged depth + temp/precip windows), <b>chronos_bolt</b> (Amazon Chronos zero-shot foundation model).</p>
         </details>
         <button id="refresh-btn" type="button">Force refresh</button>
       </div>

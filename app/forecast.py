@@ -4,9 +4,10 @@ Members
 -------
 1. persistence_lag1  yhat[t+h] = snow_depth[t]  (also the anchor target).
 2. climatology       per-DOY mean snow depth from the station's record.
-3. snow17_lite       physics-inspired SWE accumulator (precip below freeze
-                     adds to SWE; degree-day melt above 0C subtracts) plus
-                     a dynamic density estimator to convert SWE -> depth.
+3. snow17            Full Anderson 1976 SNOW-17 conceptual model — seasonal
+                     temperature-index melt, ATI-driven refreeze, rain-on-snow
+                     turbulent energy balance, Hedstrom-Pomeroy fresh-snow
+                     density, Anderson compaction. See app/snow17.py.
 4. nbm_snowfall      cumulative NBM snowfall above last observed depth,
                      decayed by a positive-degree-day melt term.
 5. ridge_snow        LightGBM (falls back to Ridge) on lagged depth, DOY,
@@ -41,7 +42,7 @@ import pandas as pd
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 
-from . import nbm as _nbm, snotel, weather
+from . import nbm as _nbm, snotel, snow17 as _snow17, weather
 
 try:
     import lightgbm as _lgb
@@ -67,9 +68,12 @@ PRECIP_WINDOWS = [1, 3, 7, 14]
 TEMP_WINDOWS = [3, 7, 14]
 PRECIP_LAGS = [1, 2, 3, 5, 7]
 SNOW_DENSITY_DEFAULT = 0.30              # SWE/depth ratio when no obs pair available
-MELT_FACTOR_IN_PER_DEGC_DAY = 0.10       # degree-day melt of depth (in/day per +1C above 0)
-SWE_MELT_FACTOR = 0.04                   # degree-day melt of SWE (in/day per +1C above 0)
-FREEZE_THRESHOLD_C = 1.0                 # tmean below this -> precip falls as snow
+# NBM short-range member uses these constants directly (it's a simple
+# add-snowfall-with-melt rule, not a full snowpack model — when both NBM and
+# snow17 agree the blend gets a robust point; when they diverge the stacker
+# can route through the more skillful one for the regime).
+MELT_FACTOR_IN_PER_DEGC_DAY = 0.10
+FREEZE_THRESHOLD_C = 1.0
 
 _CHRONOS_PIPE = None
 
@@ -134,47 +138,15 @@ def _member_climatology(clim: Optional[pd.Series], anchor_date: date, horizon: i
     return out
 
 
-def _member_snow17_lite(
+def _member_snow17(
     last_depth: float, last_swe: Optional[float], wx_forecast: pd.DataFrame,
-    *, density_hint: float = SNOW_DENSITY_DEFAULT,
+    *, params: _snow17.Snow17Params,
 ) -> List[float]:
-    """Tiny accumulation/melt physics model.
-
-    State carries SWE in inches and snow depth in inches. Each forecast day:
-      - if tmean <= FREEZE_THRESHOLD_C: precip_sum -> SWE += precip; depth += snowfall_sum
-      - else: SWE -= SWE_MELT_FACTOR * max(0, tmean) (in/day)
-              depth -= MELT_FACTOR_IN_PER_DEGC_DAY * max(0, tmean)
-    Depth is also constrained so SWE/depth ratio stays in [0.10, 0.55].
-    """
-    if wx_forecast is None or wx_forecast.empty:
-        return []
-    swe = float(last_swe) if last_swe is not None and np.isfinite(last_swe) else float(last_depth) * density_hint
-    depth = float(last_depth)
-    out: List[float] = []
-    for _, row in wx_forecast.iterrows():
-        tmean_c = row.get("temperature_2m_mean")
-        precip_mm = row.get("precipitation_sum") or 0.0
-        snowfall_cm = row.get("snowfall_sum") or 0.0
-        snowfall_in = snowfall_cm / 2.54
-        precip_in = (precip_mm or 0.0) / 25.4
-        if tmean_c is None or not np.isfinite(tmean_c):
-            tmean_c = 0.0
-        if tmean_c <= FREEZE_THRESHOLD_C:
-            swe += precip_in
-            depth += snowfall_in if snowfall_in > 0 else (precip_in / max(density_hint, 0.1))
-        else:
-            melt = max(0.0, tmean_c) * SWE_MELT_FACTOR
-            swe = max(0.0, swe - melt)
-            depth = max(0.0, depth - max(0.0, tmean_c) * MELT_FACTOR_IN_PER_DEGC_DAY)
-            depth = max(0.0, depth + (precip_in if tmean_c <= FREEZE_THRESHOLD_C else 0.0))
-        if depth > 0 and swe > 0:
-            ratio = swe / depth
-            if ratio < 0.10:
-                depth = swe / 0.10
-            elif ratio > 0.55:
-                depth = swe / 0.55
-        out.append(round(depth, 3))
-    return out
+    """Anderson 1976 SNOW-17 conceptual model. See app/snow17.py."""
+    return _snow17.predict(
+        last_depth_in=last_depth, last_swe_in=last_swe,
+        wx_forecast=wx_forecast, params=params,
+    )
 
 
 def _member_nbm_snowfall(last_depth: float, nbm_df: pd.DataFrame, horizon: int) -> List[float]:
@@ -385,7 +357,7 @@ class StationForecast:
 _DECAY_BY_MEMBER = {
     "persistence_lag1": 0,         # IS the anchor — no correction needed
     "climatology": 5,
-    "snow17_lite": 5,
+    "snow17": 5,
     "nbm_snowfall": 6,
     "ridge_snow": 5,
     "chronos_bolt": 4,
@@ -533,9 +505,13 @@ def forecast_station(
     if clim_pred:
         members_raw["climatology"] = clim_pred
 
-    s17 = _member_snow17_lite(last_depth, last_swe, wx_fcst.head(horizon))
+    snow17_params = _snow17.default_params(
+        elev_m=(float(station.get("elevation_ft")) * 0.3048) if station.get("elevation_ft") else None,
+        lat_deg=float(station.get("lat") or 45.0),
+    )
+    s17 = _member_snow17(last_depth, last_swe, wx_fcst.head(horizon), params=snow17_params)
     if s17:
-        members_raw["snow17_lite"] = s17
+        members_raw["snow17"] = s17
 
     nbm_pred = _member_nbm_snowfall(last_depth, nbm_fcst, horizon)
     if nbm_pred:
@@ -576,8 +552,8 @@ def forecast_station(
     # persistence MAE scaled by 1.0 (snow17), 1.1 (nbm), 0.9 (chronos guess).
     # The MAE-blend protects us — if a member is bad on the current issued
     # forecast its anchor-corrected value won't drag the blend much.
-    if "snow17_lite" in members_raw:
-        rolling_mae["snow17_lite"] = rolling_mae["persistence_lag1"]
+    if "snow17" in members_raw:
+        rolling_mae["snow17"] = rolling_mae["persistence_lag1"]
     if "nbm_snowfall" in members_raw:
         rolling_mae["nbm_snowfall"] = rolling_mae["persistence_lag1"] * 1.1
     if "chronos_bolt" in members_raw:

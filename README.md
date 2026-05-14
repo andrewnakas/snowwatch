@@ -12,8 +12,11 @@ Members:
 
 - `persistence_lag1` — naive baseline (yhat = last observed snow depth).
 - `climatology` — per-DOY mean snow depth from the station's full record.
-- `snow17_lite` — degree-day accumulation/melt of forecast precip + temp,
-  converted to depth via a dynamic snow density estimate.
+- `snow17` — full Anderson 1976 SNOW-17 conceptual snowpack model. Daily
+  step with seasonal temperature-index melt (MFMAX/MFMIN swing), antecedent
+  temperature index, negative-degree-day refreeze, rain-on-snow turbulent
+  energy balance, Hedstrom-Pomeroy fresh-snow density, Anderson compaction.
+  Per-station parameters seeded from elevation + latitude.
 - `nbm_snowfall` — NOAA NBM daily snowfall added to last observed depth and
   decayed by a degree-day melt term.
 - `ridge_snow` — LightGBM (falls back to Ridge) on lagged depth + DOY +
@@ -82,6 +85,7 @@ scripts/
 ## Roadmap
 
 - [x] v1: persistence + climatology + snow17_lite + nbm_snowfall + ridge_snow + chronos
+- [x] v1.1: replace snow17_lite with full SNOW-17 (refreeze, rain-on-snow, density compaction)
 - [ ] v1.1: add a pooled LightGBM blend across stations (RiverWatch2's lgbm_pooled)
 - [ ] v1.2: SNODAS gridded SWE/melt covariates for unsited backfill
 - [ ] v1.3: per-horizon stacker meta-learner trained on rolling holdouts
