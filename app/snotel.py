@@ -51,10 +51,23 @@ _ELT_TO_KEY = {
 }
 
 
-def _http_json(url: str, timeout: int = 60) -> object:
+def _http_json(url: str, timeout: int = 60, *, retries: int = 3) -> object:
+    """GET JSON with bounded retries. AWDB intermittently SSL-handshake-times-out
+    under load (especially during CI fan-out); a couple of short retries with
+    backoff turns those transient failures into successes."""
     req = Request(url, headers={"User-Agent": "snowwatch/0.1"})
-    with urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt + 1)  # 2s, 3s, 5s
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("unreachable")
 
 
 def _catalog_path() -> Path:

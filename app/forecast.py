@@ -290,8 +290,15 @@ def _member_ridge_snow(
     df = feats.dropna(subset=["depth"]).copy()
     if len(df) < 120:
         return [], {}
-    X_full = df[feat_cols].values
-    y_full = df["depth"].values
+    # Coerce features to numeric. SNOTEL/Open-Meteo occasionally returns string
+    # cells for variables they don't report; pandas keeps them as object dtype
+    # and `np.isnan` on object arrays raises ValueError. `errors="coerce"`
+    # promotes them to NaN, which the lag/window/imputation logic already
+    # tolerates downstream.
+    for c in feat_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    X_full = df[feat_cols].to_numpy(dtype=float, copy=True)
+    y_full = pd.to_numeric(df["depth"], errors="coerce").to_numpy(dtype=float)
 
     # Holdout for rolling MAE: last 30 days, predicting each horizon.
     n = len(df)
