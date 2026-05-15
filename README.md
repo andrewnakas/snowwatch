@@ -86,7 +86,8 @@ scripts/
 
 - [x] v1: persistence + climatology + snow17_lite + nbm_snowfall + ridge_snow + chronos
 - [x] v1.1: replace snow17_lite with full SNOW-17 (refreeze, rain-on-snow, density compaction)
-- [ ] v1.1: add a pooled LightGBM blend across stations (RiverWatch2's lgbm_pooled)
-- [ ] v1.2: SNODAS gridded SWE/melt covariates for unsited backfill
-- [ ] v1.3: per-horizon stacker meta-learner trained on rolling holdouts
-- [ ] v1.4: climatology-driven year-overlay widget on the chart
+- [x] v1.2: per-station SNOW-17 parameter calibration (L-BFGS-B over MFMAX/MFMIN/UADJ/PXTEMP, weekly workflow)
+- [ ] v1.3: walk-forward backtest of every member to replace proxy MAEs
+- [ ] v1.4: elevation lapse-rate + dewpoint + SRAD covariates
+- [ ] v1.5: pooled LightGBM stacker meta-learner
+- [ ] v1.6: full snow-water year history overlay (Oct 1 baseline + multi-year climatology band)

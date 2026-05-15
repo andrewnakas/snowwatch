@@ -115,10 +115,16 @@ function _renderChart() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, cssW, cssH);
 
-  // Trim history to the last 90 days for legibility.
+  // Show the full snow-water year: clip history to Oct 1 of the current
+  // season (Oct 1 of the previous calendar year if we're before Oct, else
+  // Oct 1 of the current year).
   const histAll = _chartState.history.filter(p => p.snow_depth_in != null);
-  const cutoff = Date.now() - 90 * MS_PER_DAY;
-  const hist = histAll.filter(p => Date.parse(p.date) >= cutoff);
+  const now = new Date();
+  const seasonStart = new Date(Date.UTC(
+    now.getUTCMonth() >= 9 ? now.getUTCFullYear() : now.getUTCFullYear() - 1,
+    9, 1,
+  )).getTime();
+  const hist = histAll.filter(p => Date.parse(p.date) >= seasonStart);
   const blend = _chartState.blend;
   const memberKeys = Object.keys(_chartState.members);
   if (!hist.length && !blend.length) {

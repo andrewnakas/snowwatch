@@ -118,7 +118,9 @@ def _fresh_snow_density(t_air_c: float) -> float:
     """Hedstrom & Pomeroy (1998) fresh-snow density (g/cm³)."""
     if t_air_c is None or not np.isfinite(t_air_c):
         t_air_c = -5.0
-    rho_new = 0.05 + 0.0017 * max(-15.0, min(t_air_c, 0.0)) + 0.0017 * (t_air_c + 15.0) ** 1.5
+    # Clamp BOTH terms — H-P uses (T+15)^1.5 which goes complex below -15°C.
+    t_clip = max(-15.0, min(t_air_c, 0.0))
+    rho_new = 0.05 + 0.0017 * t_clip + 0.0017 * (t_clip + 15.0) ** 1.5
     return max(0.05, min(0.20, rho_new))
 
 

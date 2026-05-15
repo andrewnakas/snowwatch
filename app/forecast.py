@@ -42,7 +42,7 @@ import pandas as pd
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 
-from . import nbm as _nbm, snotel, snow17 as _snow17, weather
+from . import nbm as _nbm, snotel, snow17 as _snow17, snow17_calibrate as _snow17_cal, weather
 
 try:
     import lightgbm as _lgb
@@ -509,6 +509,9 @@ def forecast_station(
         elev_m=(float(station.get("elevation_ft")) * 0.3048) if station.get("elevation_ft") else None,
         lat_deg=float(station.get("lat") or 45.0),
     )
+    triplet = station.get("triplet")
+    if triplet:
+        snow17_params = _snow17_cal.apply_cached(triplet, snow17_params)
     s17 = _member_snow17(last_depth, last_swe, wx_fcst.head(horizon), params=snow17_params)
     if s17:
         members_raw["snow17"] = s17
