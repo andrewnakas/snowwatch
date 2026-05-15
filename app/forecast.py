@@ -437,6 +437,143 @@ def _build_daily_forecast(
     return out
 
 
+def _walkforward_snow17_mae(
+    hist: pd.DataFrame, wx_hist: pd.DataFrame, *,
+    horizon: int, params: _snow17.Snow17Params,
+    n_issues: int = 8, stride: int = 7,
+) -> Optional[float]:
+    """True walk-forward MAE for SNOW-17 using observed historical weather.
+
+    Issue the model at `n_issues` evenly-spaced dates in the last
+    ~`n_issues * stride` days; at each issue point we seed from the
+    SNOTEL-observed (depth, SWE) on the issue date, run snow17 forward for
+    `horizon` days using Open-Meteo *historical* weather, and compare to
+    observed snow_depth. This is the right proxy for snow17 skill because
+    in production we use NBM/blend forecast weather, not perfect-foresight.
+    The historical-weather run separates the model's structural skill
+    (which is what the MAE-blend weights against) from the forecast input
+    quality (which is dealt with by the anchor + decay).
+    """
+    if hist is None or hist.empty or wx_hist is None or wx_hist.empty:
+        return None
+    h = hist[["date", "snow_depth_in", "swe_in"]].copy()
+    h["date"] = pd.to_datetime(h["date"]).dt.date
+    w = wx_hist.copy()
+    w["date"] = pd.to_datetime(w["date"]).dt.date
+    df = h.merge(w, on="date", how="inner").dropna(subset=["snow_depth_in"], how="any")
+    if len(df) < horizon + n_issues * stride + 5:
+        return None
+    df = df.sort_values("date").reset_index(drop=True)
+
+    end_idx = len(df) - horizon - 1
+    issues = [end_idx - i * stride for i in range(n_issues) if end_idx - i * stride > horizon]
+    if not issues:
+        return None
+
+    errors: List[float] = []
+    for issue in issues:
+        seed = df.iloc[issue]
+        d0 = float(seed["snow_depth_in"])
+        swe0 = float(seed["swe_in"]) if pd.notna(seed["swe_in"]) else None
+        wx_window = df.iloc[issue + 1 : issue + 1 + horizon].copy()
+        if len(wx_window) < horizon:
+            continue
+        try:
+            pred = _snow17.predict(
+                last_depth_in=d0, last_swe_in=swe0,
+                wx_forecast=wx_window, params=params,
+            )
+        except Exception:
+            continue
+        if not pred or len(pred) < horizon:
+            continue
+        truth = df.iloc[issue + 1 : issue + 1 + horizon]["snow_depth_in"].to_numpy(dtype=float)
+        if not np.isfinite(truth).all():
+            continue
+        errors.append(float(np.mean(np.abs(np.array(pred[:horizon]) - truth))))
+    return float(np.mean(errors)) if errors else None
+
+
+def _walkforward_nbm_proxy_mae(
+    hist: pd.DataFrame, wx_hist: pd.DataFrame, *,
+    horizon: int, n_issues: int = 8, stride: int = 7,
+) -> Optional[float]:
+    """Backtest the NBM member with archive snowfall as a stand-in for NBM.
+
+    NBM doesn't expose a public archive, but `_member_nbm_snowfall` is just
+    "add forecast snowfall to last observed depth, decay with degree-days".
+    Replaying it against Open-Meteo archive snowfall + tmean gives a realistic
+    upper bound on NBM skill — actual NBM does slightly better day-1 and is
+    similar by day-7, so this is conservative.
+    """
+    if hist is None or hist.empty or wx_hist is None or wx_hist.empty:
+        return None
+    h = hist[["date", "snow_depth_in"]].copy()
+    h["date"] = pd.to_datetime(h["date"]).dt.date
+    w = wx_hist.copy()
+    w["date"] = pd.to_datetime(w["date"]).dt.date
+    df = h.merge(w, on="date", how="inner").dropna(subset=["snow_depth_in"], how="any")
+    if len(df) < horizon + n_issues * stride + 5:
+        return None
+    df = df.sort_values("date").reset_index(drop=True)
+
+    end_idx = len(df) - horizon - 1
+    issues = [end_idx - i * stride for i in range(n_issues) if end_idx - i * stride > horizon]
+    if not issues:
+        return None
+
+    errors: List[float] = []
+    for issue in issues:
+        d0 = float(df.iloc[issue]["snow_depth_in"])
+        wx_window = df.iloc[issue + 1 : issue + 1 + horizon]
+        # Map Open-Meteo columns onto the structure _member_nbm_snowfall expects.
+        proxy = pd.DataFrame({
+            "date": wx_window["date"].values,
+            "nbm_snowfall_sum": wx_window["snowfall_sum"].values,   # already cm
+            "nbm_tmean": wx_window["temperature_2m_mean"].values,
+        })
+        try:
+            pred = _member_nbm_snowfall(d0, proxy, horizon)
+        except Exception:
+            continue
+        if not pred or len(pred) < horizon:
+            continue
+        truth = wx_window["snow_depth_in"].to_numpy(dtype=float) if "snow_depth_in" in wx_window.columns \
+            else df.iloc[issue + 1 : issue + 1 + horizon]["snow_depth_in"].to_numpy(dtype=float)
+        if not np.isfinite(truth).all():
+            continue
+        errors.append(float(np.mean(np.abs(np.array(pred[:horizon]) - truth))))
+    return float(np.mean(errors)) if errors else None
+
+
+def _walkforward_chronos_mae(
+    series: pd.Series, *, horizon: int, n_issues: int = 6, stride: int = 7,
+) -> Optional[float]:
+    """Walk-forward MAE for Chronos-Bolt. Chronos is the priciest member
+    (foundation-model forward pass) so we keep n_issues small."""
+    s = series.dropna()
+    if len(s) < horizon + n_issues * stride + 30:
+        return None
+    end_idx = len(s) - horizon - 1
+    issues = [end_idx - i * stride for i in range(n_issues) if end_idx - i * stride > horizon]
+    if not issues:
+        return None
+    errors: List[float] = []
+    for issue in issues:
+        train = s.iloc[: issue + 1]
+        truth = s.iloc[issue + 1 : issue + 1 + horizon].to_numpy(dtype=float)
+        if len(truth) < horizon or not np.isfinite(truth).all():
+            continue
+        try:
+            pred = _member_chronos(train, horizon)
+        except Exception:
+            continue
+        if not pred or len(pred) < horizon:
+            continue
+        errors.append(float(np.mean(np.abs(np.array(pred[:horizon]) - truth))))
+    return float(np.mean(errors)) if errors else None
+
+
 def _rolling_validation_mae(
     series: pd.Series, member_fn, *, horizon: int, holdout: int = 14,
 ) -> Optional[float]:
@@ -550,17 +687,21 @@ def forecast_station(
     if ridge_mae_by_h:
         rolling_mae["ridge_snow"] = float(np.mean(list(ridge_mae_by_h.values())))
 
-    # snow17 / nbm / chronos: bias toward persistence MAE because we can't
-    # replay historical NBM forecasts. We assign their rolling MAE as the
-    # persistence MAE scaled by 1.0 (snow17), 1.1 (nbm), 0.9 (chronos guess).
-    # The MAE-blend protects us — if a member is bad on the current issued
-    # forecast its anchor-corrected value won't drag the blend much.
+    # snow17 / nbm / chronos: replace the old persistence-scaled proxies with
+    # real walk-forward MAEs. snow17 uses observed Open-Meteo weather as a
+    # perfect-foresight stand-in for forecast input; nbm uses Open-Meteo
+    # snowfall as a stand-in for the NBM snowfall feed; chronos walks
+    # forward on the raw depth series. Each falls back to the persistence
+    # proxy if it doesn't have enough usable history.
     if "snow17" in members_raw:
-        rolling_mae["snow17"] = rolling_mae["persistence_lag1"]
+        s17_mae = _walkforward_snow17_mae(hist, wx_hist, horizon=horizon, params=snow17_params)
+        rolling_mae["snow17"] = s17_mae if s17_mae is not None else rolling_mae["persistence_lag1"]
     if "nbm_snowfall" in members_raw:
-        rolling_mae["nbm_snowfall"] = rolling_mae["persistence_lag1"] * 1.1
+        nbm_mae = _walkforward_nbm_proxy_mae(hist, wx_hist, horizon=horizon)
+        rolling_mae["nbm_snowfall"] = nbm_mae if nbm_mae is not None else rolling_mae["persistence_lag1"] * 1.1
     if "chronos_bolt" in members_raw:
-        rolling_mae["chronos_bolt"] = rolling_mae["persistence_lag1"] * 0.95
+        c_mae = _walkforward_chronos_mae(depth_series, horizon=horizon)
+        rolling_mae["chronos_bolt"] = c_mae if c_mae is not None else rolling_mae["persistence_lag1"] * 0.95
 
     # Anchor every member to last observed depth.
     members_anchored: Dict[str, List[float]] = {}
