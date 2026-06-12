@@ -23,9 +23,20 @@ from app import snotel  # noqa: E402
 OUT = ROOT / "data" / "stations.json"
 
 
+MIN_PLAUSIBLE_STATIONS = 500  # network runs ~900 active sites
+
+
 def main() -> int:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     sites = snotel.list_active_stations(max_age_days=0)  # force a fresh pull
+    if len(sites) < MIN_PLAUSIBLE_STATIONS:
+        # AWDB hiccup. Writing a tiny/empty catalogue is how CI builds an
+        # empty site and backfill shards no-op "successfully" (2026-06-12:
+        # a runner got 0 stations and the whole backfill run was wasted).
+        # Fail loudly and leave any existing catalogue untouched.
+        print(f"ERROR: AWDB returned {len(sites)} stations "
+              f"(< {MIN_PLAUSIBLE_STATIONS}); refusing to write {OUT}")
+        return 1
     sites.sort(key=lambda s: (s.get("state") or "", s.get("name") or ""))
     print(f"writing {len(sites)} active SNOTEL stations -> {OUT}")
     OUT.write_text(json.dumps({"stations": sites}, indent=2))

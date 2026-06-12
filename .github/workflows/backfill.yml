@@ -85,7 +85,10 @@ jobs:
 
   merge:
     needs: backfill
-    if: always() && needs.backfill.result != 'cancelled'
+    # always(): job-timeout shards conclude "cancelled", and we still want to
+    # merge whatever the surviving shards uploaded (2026-06-12: two timed-out
+    # shards marked the run cancelled and the merge skipped shards 0/3's work)
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
