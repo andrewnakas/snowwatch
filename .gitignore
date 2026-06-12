@@ -6,6 +6,9 @@ venv/
 .env
 .DS_Store
 data/cache/
+data/stations.json
+data/prevruns/
+data/training/
 dist/
 logs/
 *.log

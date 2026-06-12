@@ -485,6 +485,39 @@ function renderMemberTable(payload) {
   </table>`;
 }
 
+function renderNwsDivergence(payload) {
+  const el = document.getElementById("nws-divergence");
+  const nd = payload.nws_divergence;
+  if (!el) return;
+  if (!nd || !nd.available || !nd.summary) {
+    el.innerHTML = "";
+    return;
+  }
+  const s = nd.summary;
+  const delta = s.final_delta_in;
+  const deltaTxt = delta != null ? `${delta >= 0 ? "+" : ""}${delta.toFixed(1)} in` : "—";
+  const rows = (nd.daily || []).map(d => `
+    <tr>
+      <td>${d.date}</td>
+      <td>${fmtNumber(d.sw_depth_in, 1)}</td>
+      <td>${fmtNumber(d.nws_implied_depth_in, 1)}</td>
+      <td>${d.delta_in != null ? (d.delta_in >= 0 ? "+" : "") + d.delta_in.toFixed(1) : "—"}</td>
+      <td>${fmtNumber(d.nws_snowfall_in, 1)}${d.above_nws_snow_line ? " ⚠" : ""}</td>
+      <td>${fmtNumber(d.sw_snowfall_in, 1)}</td>
+    </tr>`).join("");
+  el.innerHTML = `
+    <details class="mae-explainer">
+      <summary>vs NWS official forecast${s.office ? ` (${s.office})` : ""}: ${deltaTxt} at day +${s.horizon_days}</summary>
+      <p>${s.headline || ""}</p>
+      <table>
+        <thead><tr><th>Date</th><th>SW depth</th><th>NWS depth</th><th>Δ in</th><th>NWS snow</th><th>SW snow</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <p style="opacity:0.7">"NWS depth" applies NWS snowfall + degree-day melt to today's observed depth — what you'd expect trusting the public forecast verbatim. ⚠ marks days the NWS snow level sits above the station (forecast snowfall may verify as rain).</p>
+    </details>
+  `;
+}
+
 async function selectStation(station) {
   currentStation = station;
   document.getElementById("panel-empty").style.display = "none";
@@ -497,6 +530,7 @@ async function selectStation(station) {
     renderMeta(station, payload);
     renderSummary(payload);
     renderMemberTable(payload);
+    renderNwsDivergence(payload);
     drawChart(document.getElementById("chart"), payload.history, payload.members, payload.blend, payload.last_observed_date);
     _latestDaily = payload.daily_forecast || [];
     drawSnowfallChart(document.getElementById("snowfall-chart"), _latestDaily);

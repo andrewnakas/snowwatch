@@ -14,7 +14,7 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write   # merge job appends the forecast archive to monthly Release assets
   pages: write
   id-token: write
 
@@ -69,16 +69,33 @@ jobs:
         # shards 1..N start before shard 0 has finished writing the file.
         run: python scripts/fetch_stations.py
 
+      - name: Decide ensemble fetch window
+        # Member-level ensemble pulls are the heaviest Open-Meteo calls; do
+        # them on the 00Z and 12Z builds only. Other builds reuse the <=11h
+        # cache (see app/met.py).
+        id: ens
+        run: |
+          HOUR=$(date -u +%H)
+          if [ "$HOUR" -lt 6 ] || { [ "$HOUR" -ge 12 ] && [ "$HOUR" -lt 18 ]; }; then
+            echo "ensemble=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "ensemble=0" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build shard ${{ matrix.shard }}/${{ env.TOTAL_SHARDS }}
         env:
           PYTHONUNBUFFERED: "1"
           SW_NO_FETCH: ${{ github.event.inputs.bootstrap == 'true' && '0' || '0' }}
           SW_ENABLE_CHRONOS: "1"
+          SW_ENSEMBLE_BUILD: ${{ steps.ens.outputs.ensemble }}
         run: |
           python scripts/build_static_site.py \
             --shard-id ${{ matrix.shard }} \
             --total-shards ${{ env.TOTAL_SHARDS }} \
             --horizon 7
+
+      - name: Archive shard forecasts
+        run: python scripts/archive_forecasts.py --shard-id ${{ matrix.shard }}
 
       - name: Upload shard artifact
         uses: actions/upload-artifact@v4
@@ -106,6 +123,27 @@ jobs:
 
       - name: Merge shards
         run: python scripts/merge_shards.py --input-root shard_dists
+
+      - name: Append forecast archive to monthly Release asset
+        # Headerless gzip CSV streams are byte-appendable; the monthly asset
+        # grows by simple concat. The release is created on first use.
+        if: hashFiles('forecast_archive_build.csv.gz') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="forecast-archive"
+          MONTH=$(date -u +%Y-%m)
+          ASSET="archive-${MONTH}.csv.gz"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "Forecast archive" \
+              --notes "Rolling long-format forecast archive (headerless gzip CSV, schema in app/archive.py)"
+          if gh release download "$TAG" --pattern "$ASSET" --output existing.csv.gz 2>/dev/null; then
+            cat existing.csv.gz forecast_archive_build.csv.gz > "$ASSET"
+          else
+            cp forecast_archive_build.csv.gz "$ASSET"
+          fi
+          gh release upload "$TAG" "$ASSET" --clobber
+          echo "uploaded $ASSET ($(du -k "$ASSET" | cut -f1) KB)"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

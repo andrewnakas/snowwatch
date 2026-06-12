@@ -35,7 +35,7 @@ def main() -> int:
     # First shard owns the assets (it always emits dist/index.html, stations.json, static/).
     asset_shard = next((d for d in shard_dirs if (d / "index.html").exists()), shard_dirs[0])
     for item in asset_shard.iterdir():
-        if item.name == "forecasts":
+        if item.name == "forecasts" or item.name.startswith("forecast_archive_"):
             continue
         dst = DIST / item.name
         if item.is_dir():
@@ -94,6 +94,23 @@ def main() -> int:
         "forecast_files": total_files,
     }
     (DIST / "index_summary.json").write_text(json.dumps(merged_summary, indent=2))
+
+    # Concatenate per-shard forecast archives (gzip streams byte-append into a
+    # valid multi-stream gzip; see app/archive.py). Written OUTSIDE dist/ so it
+    # rides as a workflow artifact, not onto the Pages deployment.
+    archive_out = ROOT / "forecast_archive_build.csv.gz"
+    n_arch = 0
+    with open(archive_out, "wb") as out_f:
+        for d in shard_dirs:
+            for shard_arch in sorted(d.glob("forecast_archive_shard_*.csv.gz")):
+                out_f.write(shard_arch.read_bytes())
+                n_arch += 1
+    if n_arch:
+        print(f"concatenated {n_arch} shard archives -> {archive_out} "
+              f"({archive_out.stat().st_size / 1024:.0f} KB)")
+    else:
+        archive_out.unlink(missing_ok=True)
+
     print(f"merged: {total_files} forecast JSONs, {succeeded} succeeded across {len(shard_dirs)} shards")
     return 0
 

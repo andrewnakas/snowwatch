@@ -40,6 +40,9 @@ canvas { width: 100%; max-width: 100%; background: #131f37; border-radius: 10px;
 .mae-explainer p { margin: 8px 0; line-height: 1.5; }
 .mae-explainer code { background: #1f2942; padding: 1px 5px; border-radius: 4px; color: #e7ecf3; font-size: 11px; }
 .mae-explainer b { color: #e7ecf3; }
+.mae-explainer table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+.mae-explainer th, .mae-explainer td { padding: 3px 6px; border-bottom: 1px solid #1f2942; text-align: right; }
+.mae-explainer th:first-child, .mae-explainer td:first-child { text-align: left; }
 
 @media (max-width: 900px) {
   body { overflow-y: auto; }

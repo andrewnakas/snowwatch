@@ -199,6 +199,161 @@ def fetch_history(triplet: str, start: date, end: date, *, max_age_hours: int = 
     return _slice(have, start, end)
 
 
+def fetch_history_batch(
+    triplets: list[str], start: date, end: date, *, max_age_hours: int = 12,
+    chunk_size: int = 40,
+) -> dict[str, pd.DataFrame]:
+    """Daily history for many stations with batched AWDB calls.
+
+    AWDB's /data endpoint accepts comma-separated stationTriplets, so training
+    jobs can pull ~40 stations per request instead of one. Stations whose
+    on-disk record already covers [start, end] are served from cache and not
+    re-requested; the rest are fetched in chunks and their per-station caches
+    updated, keeping cache layout identical to `fetch_history`.
+    """
+    out: dict[str, pd.DataFrame] = {}
+    stale: list[str] = []
+    recs: dict[str, dict] = {}
+    for t in triplets:
+        rp = _record_path(t)
+        rec: dict = {}
+        if rp.exists():
+            try:
+                rec = json.loads(rp.read_text())
+            except Exception:
+                rec = {}
+        recs[t] = rec
+        have = rec.get("rows", {})
+        last_known = rec.get("last_known")
+        first_known = rec.get("first_known") or (min(have.keys()) if have else None)
+        age = time.time() - float(rec.get("fetched_at", 0)) if rec.get("fetched_at") else float("inf")
+        covered = (
+            first_known and first_known <= start.isoformat()
+            and last_known and last_known >= end.isoformat()
+            and age < max_age_hours * 3600
+        )
+        if covered or _no_fetch():
+            out[t] = _slice(have, start, end)
+        else:
+            stale.append(t)
+
+    for i in range(0, len(stale), chunk_size):
+        chunk = stale[i : i + chunk_size]
+        params = {
+            "stationTriplets": ",".join(chunk),
+            "elements": ",".join(ELEMENTS),
+            "duration": "DAILY",
+            "beginDate": start.isoformat(),
+            "endDate": end.isoformat(),
+        }
+        url = f"{API}/data?" + urlencode(params)
+        try:
+            payload = _http_json(url, timeout=120)
+        except Exception:
+            payload = []
+        by_triplet: dict[str, dict] = {t: {} for t in chunk}
+        for station_payload in payload if isinstance(payload, list) else []:
+            t = station_payload.get("stationTriplet")
+            if t not in by_triplet:
+                continue
+            _merge_payload_rows(station_payload, by_triplet[t])
+        for t in chunk:
+            have = recs[t].get("rows", {})
+            fresh = by_triplet.get(t) or {}
+            for d_iso, cell in fresh.items():
+                have.setdefault(d_iso, {}).update(cell)
+            if fresh and have:
+                rec = {
+                    "stationTriplet": t,
+                    "rows": have,
+                    "first_known": min(have.keys()),
+                    "last_known": max(have.keys()),
+                    "fetched_at": time.time(),
+                }
+                _record_path(t).write_text(json.dumps(rec, separators=(",", ":")))
+            out[t] = _slice(have, start, end)
+    return out
+
+
+HOURLY_DIR = ROOT / "snotel_hourly"
+HOURLY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def fetch_history_hourly(
+    triplet: str, start: date, end: date, *, max_age_hours: int = 12,
+) -> pd.DataFrame:
+    """Hourly SNWD/WTEQ for one station (raw, NRCS-unedited — caller must QC).
+
+    Used by the training job to rebuild clean daily targets for stations whose
+    daily series trips QC flags; not called in the 6h build. Columns:
+        datetime (ISO hour), swe_in, snow_depth_in
+    """
+    safe = triplet.replace(":", "_")
+    p = HOURLY_DIR / f"{safe}_{start.isoformat()}_{end.isoformat()}.json"
+    cols = ["datetime", "swe_in", "snow_depth_in"]
+    if p.exists() and (time.time() - p.stat().st_mtime) < max_age_hours * 3600:
+        try:
+            return pd.DataFrame(json.loads(p.read_text()), columns=cols)
+        except Exception:
+            pass
+    if _no_fetch():
+        return pd.DataFrame(columns=cols)
+    params = {
+        "stationTriplets": triplet,
+        "elements": "WTEQ,SNWD",
+        "duration": "HOURLY",
+        "beginDate": start.isoformat(),
+        "endDate": end.isoformat(),
+    }
+    url = f"{API}/data?" + urlencode(params)
+    try:
+        payload = _http_json(url, timeout=120)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+    rows: dict[str, dict] = {}
+    for station_payload in payload if isinstance(payload, list) else []:
+        for elt in station_payload.get("data", []):
+            code = elt.get("stationElement", {}).get("elementCode")
+            if code not in ("WTEQ", "SNWD"):
+                continue
+            key = _ELT_TO_KEY[code]
+            for row in elt.get("values", []) or []:
+                dt = row.get("date")
+                v = row.get("value")
+                if dt is None or v is None:
+                    continue
+                rows.setdefault(dt, {})[key] = float(v)
+    out = [
+        {"datetime": dt, "swe_in": cell.get("swe_in"), "snow_depth_in": cell.get("snow_depth_in")}
+        for dt, cell in sorted(rows.items())
+    ]
+    try:
+        p.write_text(json.dumps(out, separators=(",", ":")))
+    except Exception:
+        pass
+    return pd.DataFrame(out, columns=cols)
+
+
+def _merge_payload_rows(station_payload: dict, have: dict) -> bool:
+    """Merge one station's AWDB /data payload into a `rows` dict; True if any."""
+    added = False
+    for elt in station_payload.get("data", []):
+        code = elt.get("stationElement", {}).get("elementCode")
+        if code not in _ELT_TO_KEY:
+            continue
+        key = _ELT_TO_KEY[code]
+        for row in elt.get("values", []) or []:
+            d = row.get("date")
+            v = row.get("value")
+            if d is None or v is None:
+                continue
+            d = d[:10]
+            cell = have.setdefault(d, {})
+            cell[key] = float(v)
+            added = True
+    return added
+
+
 def _fetch_and_merge(triplet: str, have: dict, start: date, end: date) -> bool:
     params = {
         "stationTriplets": triplet,
@@ -216,20 +371,7 @@ def _fetch_and_merge(triplet: str, have: dict, start: date, end: date) -> bool:
         return False
     added = False
     for station_payload in payload:
-        for elt in station_payload.get("data", []):
-            code = elt.get("stationElement", {}).get("elementCode")
-            if code not in _ELT_TO_KEY:
-                continue
-            key = _ELT_TO_KEY[code]
-            for row in elt.get("values", []) or []:
-                d = row.get("date")
-                v = row.get("value")
-                if d is None or v is None:
-                    continue
-                d = d[:10]
-                cell = have.setdefault(d, {})
-                cell[key] = float(v)
-                added = True
+        added = _merge_payload_rows(station_payload, have) or added
     return added
 
 
