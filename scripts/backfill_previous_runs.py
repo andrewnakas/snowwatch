@@ -210,6 +210,8 @@ def backfill_station_model(
         cost = max(1.0, n_vars * (ce - cs).days / 100.0)
         if budget["spent"] + cost > budget["total"]:
             return fetched, skipped
+        if budget.get("deadline") and time.time() > budget["deadline"]:
+            return fetched, skipped
         hourly_vars = [f"{v}_previous_day{lead}" for v in vars_avail
                        for lead in LEADS if lead <= max_lead]
         params = {
@@ -262,6 +264,9 @@ def main() -> int:
     ap.add_argument("--end", type=lambda s: date.fromisoformat(s), default=date.today())
     ap.add_argument("--models", default="nbm,hrrr,gfs,ifs,aifs")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--max-seconds", type=float, default=0,
+                    help="stop cleanly after this wall time (set below the CI "
+                         "job timeout — a timed-out job never uploads its work)")
     args = ap.parse_args()
 
     stations_path = ROOT / "data" / "stations.json"
@@ -278,12 +283,18 @@ def main() -> int:
 
     budget = {"spent": 0.0, "total": args.budget}
     t0 = time.time()
+    if args.max_seconds > 0:
+        budget["deadline"] = t0 + args.max_seconds
     total_fetched = 0
     for i, st in enumerate(stations, 1):
         for mk in model_keys:
             f, s = backfill_station_model(
                 st["triplet"], st["lat"], st["lon"], mk, args.start, args.end, budget)
             total_fetched += f
+        if budget.get("deadline") and time.time() > budget["deadline"]:
+            print(f"deadline reached after {i}/{len(stations)} stations "
+                  f"(budget {budget['spent']:.0f}/{budget['total']:.0f})")
+            break
         if budget["spent"] >= budget["total"]:
             print(f"budget exhausted after {i}/{len(stations)} stations "
                   f"({budget['spent']:.0f}/{budget['total']:.0f})")

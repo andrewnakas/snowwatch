@@ -66,7 +66,8 @@ jobs:
           python scripts/backfill_previous_runs.py \
             --shard-id ${{ matrix.shard }} \
             --total-shards ${{ env.TOTAL_SHARDS }} \
-            --budget ${{ github.event.inputs.budget || '6000' }}
+            --budget ${{ github.event.inputs.budget || '6000' }} \
+            --max-seconds 5400
 
       - name: Keep only files this shard touched
         # The restored canonical tree contains every shard's stations; upload
