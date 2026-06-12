@@ -110,6 +110,7 @@ tests/                        pytest unit tests (targets, verification, members)
 | `SW_ENSEMBLE_BUILD=1` | Pull fresh ensemble-member spread stats (00Z/12Z builds); otherwise reuse ≤11h cache. |
 | `SW_NWS_OFF=1` | Skip api.weather.gov calls (no NWS divergence panel). |
 | `SW_MET_BUDGET` | Per-process weighted Open-Meteo call budget for `app/met.py` (degrades to cache when spent). |
+| `SW_MAE_CACHE_DAYS` | TTL for cached walk-forward member MAEs (default 7; `0` recomputes every build). |
 
 ## Roadmap
 

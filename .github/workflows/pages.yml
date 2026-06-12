@@ -28,10 +28,11 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Normal sharded builds finish well under an hour; met.py's call budget
-    # caps fetch time. A hung shard must die fast — concurrency is
-    # cancel-in-progress:false, so a zombie run blocks every later build.
-    timeout-minutes: 150
+    # Ensemble-hour builds legitimately run 2-4h per shard (per-station
+    # member pulls + NWS round-trips on flaky runner DNS). 300 still kills
+    # true zombies before they block the next 6h build forever (concurrency
+    # is cancel-in-progress:false).
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
@@ -110,6 +111,11 @@ jobs:
 
   merge:
     needs: build
+    # Deploy whatever shards delivered: a single evicted runner (it happens —
+    # shard 5 got a shutdown signal mid-build on 2026-06-12) must not take
+    # down the whole site update. Missing shards' stations 404 until the
+    # next 6h build; that beats serving a site-wide stale deploy.
+    if: always() && needs.build.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

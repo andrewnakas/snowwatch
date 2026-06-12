@@ -30,11 +30,14 @@ Members that fail validation (insufficient history, NaN MAE) get weight 0.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
+import time
 import warnings
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -445,6 +448,44 @@ _DECAY_BY_MEMBER = {
     "ridge_snow": 5,
     "chronos_bolt": 4,
 }
+
+# Walk-forward member MAEs are structural skill numbers — they drift on week
+# scales, not build scales — but computing them (snow17/chronos backtests) is
+# the heaviest CPU in the 6h build. Cache per (station, horizon) with a TTL.
+MAE_CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "cache" / "member_mae"
+
+
+def _mae_cache_ttl_days() -> float:
+    try:
+        return float(os.environ.get("SW_MAE_CACHE_DAYS", "7"))
+    except ValueError:
+        return 7.0
+
+
+def _load_mae_cache(triplet: str, horizon: int) -> Optional[Dict[str, float]]:
+    ttl = _mae_cache_ttl_days()
+    if ttl <= 0:
+        return None
+    p = MAE_CACHE_DIR / f"{triplet.replace(':', '_')}_h{horizon}.json"
+    if not p.exists() or (time.time() - p.stat().st_mtime) > ttl * 86400:
+        return None
+    try:
+        return {str(k): float(v) for k, v in json.loads(p.read_text()).items()}
+    except Exception:
+        return None
+
+
+def _save_mae_cache(triplet: str, horizon: int, rolling_mae: Dict[str, float]) -> None:
+    if _mae_cache_ttl_days() <= 0:
+        return
+    try:
+        MAE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        p = MAE_CACHE_DIR / f"{triplet.replace(':', '_')}_h{horizon}.json"
+        p.write_text(json.dumps(
+            {k: float(v) for k, v in rolling_mae.items() if v is not None and np.isfinite(v)},
+            separators=(",", ":")))
+    except Exception:
+        pass
 
 
 def _to_point_list(start: date, values: List[float]) -> List[dict]:
@@ -942,44 +983,49 @@ def forecast_station(
     # its own per-h MAE). For snow17/nbm we can't easily replay historical
     # weather forecasts, so we approximate with depth-only persistence-of-state.
     rolling_mae: Dict[str, float] = {}
+    cached_mae = _load_mae_cache(triplet, horizon) if triplet else None
+    if cached_mae is not None and all(k in cached_mae for k in members_raw):
+        rolling_mae = {k: float(cached_mae[k]) for k in members_raw}
+    else:
+        def _pers_fn(train):
+            v = float(train.iloc[-1])
+            return [v] * horizon
+        rolling_mae["persistence_lag1"] = _rolling_validation_mae(depth_series, _pers_fn, horizon=horizon) or 0.0
 
-    def _pers_fn(train):
-        v = float(train.iloc[-1])
-        return [v] * horizon
-    rolling_mae["persistence_lag1"] = _rolling_validation_mae(depth_series, _pers_fn, horizon=horizon) or 0.0
+        if "climatology" in members_raw:
+            # Backtest climatology with leave-future-out by reusing the same clim curve.
+            def _clim_fn(train):
+                anchor = pd.Timestamp(train.index[-1]).date()
+                return _member_climatology(clim, anchor, horizon, float(train.iloc[-1]))
+            rolling_mae["climatology"] = _rolling_validation_mae(depth_series, _clim_fn, horizon=horizon) or 0.0
 
-    if "climatology" in members_raw:
-        # Backtest climatology with leave-future-out by reusing the same clim curve.
-        def _clim_fn(train):
-            anchor = pd.Timestamp(train.index[-1]).date()
-            return _member_climatology(clim, anchor, horizon, float(train.iloc[-1]))
-        rolling_mae["climatology"] = _rolling_validation_mae(depth_series, _clim_fn, horizon=horizon) or 0.0
+        if ridge_mae_by_h:
+            rolling_mae["ridge_snow"] = float(np.mean(list(ridge_mae_by_h.values())))
 
-    if ridge_mae_by_h:
-        rolling_mae["ridge_snow"] = float(np.mean(list(ridge_mae_by_h.values())))
-
-    # snow17 / nbm / chronos: replace the old persistence-scaled proxies with
-    # real walk-forward MAEs. snow17 uses observed Open-Meteo weather as a
-    # perfect-foresight stand-in for forecast input; nbm uses Open-Meteo
-    # snowfall as a stand-in for the NBM snowfall feed; chronos walks
-    # forward on the raw depth series. Each falls back to the persistence
-    # proxy if it doesn't have enough usable history.
-    if "snow17" in members_raw:
-        s17_mae = _walkforward_snow17_mae(hist, wx_hist, horizon=horizon, params=snow17_params)
-        rolling_mae["snow17"] = s17_mae if s17_mae is not None else rolling_mae["persistence_lag1"]
-    if "nbm_snow17" in members_raw:
-        # NBM has no public historical archive; the structural snow17-skill
-        # number transfers since both members run identical physics. NBM
-        # inputs typically beat Open-Meteo on day-1 by a small margin, so we
-        # nudge the proxy 5% better to reflect that real-world bias.
-        nbm17_proxy = rolling_mae.get("snow17") or rolling_mae["persistence_lag1"]
-        rolling_mae["nbm_snow17"] = nbm17_proxy * 0.95
-    if "nbm_snowfall" in members_raw:
-        nbm_mae = _walkforward_nbm_proxy_mae(hist, wx_hist, horizon=horizon)
-        rolling_mae["nbm_snowfall"] = nbm_mae if nbm_mae is not None else rolling_mae["persistence_lag1"] * 1.1
-    if "chronos_bolt" in members_raw:
-        c_mae = _walkforward_chronos_mae(depth_series, horizon=horizon)
-        rolling_mae["chronos_bolt"] = c_mae if c_mae is not None else rolling_mae["persistence_lag1"] * 0.95
+        # snow17 / nbm / chronos: replace the old persistence-scaled proxies with
+        # real walk-forward MAEs. snow17 uses observed Open-Meteo weather as a
+        # perfect-foresight stand-in for forecast input; nbm uses Open-Meteo
+        # snowfall as a stand-in for the NBM snowfall feed; chronos walks
+        # forward on the raw depth series. Each falls back to the persistence
+        # proxy if it doesn't have enough usable history.
+        if "snow17" in members_raw:
+            s17_mae = _walkforward_snow17_mae(hist, wx_hist, horizon=horizon, params=snow17_params)
+            rolling_mae["snow17"] = s17_mae if s17_mae is not None else rolling_mae["persistence_lag1"]
+        if "nbm_snow17" in members_raw:
+            # NBM has no public historical archive; the structural snow17-skill
+            # number transfers since both members run identical physics. NBM
+            # inputs typically beat Open-Meteo on day-1 by a small margin, so we
+            # nudge the proxy 5% better to reflect that real-world bias.
+            nbm17_proxy = rolling_mae.get("snow17") or rolling_mae["persistence_lag1"]
+            rolling_mae["nbm_snow17"] = nbm17_proxy * 0.95
+        if "nbm_snowfall" in members_raw:
+            nbm_mae = _walkforward_nbm_proxy_mae(hist, wx_hist, horizon=horizon)
+            rolling_mae["nbm_snowfall"] = nbm_mae if nbm_mae is not None else rolling_mae["persistence_lag1"] * 1.1
+        if "chronos_bolt" in members_raw:
+            c_mae = _walkforward_chronos_mae(depth_series, horizon=horizon)
+            rolling_mae["chronos_bolt"] = c_mae if c_mae is not None else rolling_mae["persistence_lag1"] * 0.95
+        if triplet:
+            _save_mae_cache(triplet, horizon, rolling_mae)
 
     # Anchor every member to last observed depth.
     members_anchored: Dict[str, List[float]] = {}
