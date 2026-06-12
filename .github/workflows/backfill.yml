@@ -1,0 +1,125 @@
+name: Backfill previous-run forecasts
+
+# Nightly budgeted pulls from Open-Meteo's Previous-Runs API. The job is
+# resumable: data/prevruns/ persists between runs as a tarball asset on the
+# `training-data` Release, and per-chunk meta files make refetches no-ops.
+# Four shards run on separate runners (separate IPs) so each gets its own
+# API budget; their station sets are disjoint, so the merge is a pure overlay.
+
+on:
+  schedule:
+    - cron: "30 8 * * *"   # nightly, offset from the 6h Pages builds
+  workflow_dispatch:
+    inputs:
+      budget:
+        description: "Weighted Open-Meteo call budget per shard"
+        required: false
+        default: "6000"
+
+permissions:
+  contents: write   # release asset upload
+
+concurrency:
+  group: backfill
+  cancel-in-progress: false
+
+env:
+  TOTAL_SHARDS: 4
+  RELEASE_TAG: training-data
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pandas numpy
+
+      - name: Refresh SNOTEL station list
+        run: python scripts/fetch_stations.py
+
+      - name: Restore prevruns state from Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release download "$RELEASE_TAG" --pattern prevruns.tar.gz --output prevruns.tar.gz 2>/dev/null; then
+            tar -xzf prevruns.tar.gz
+            echo "restored $(find data/prevruns -name '*.csv.gz' | wc -l) station-model files"
+          else
+            echo "no existing prevruns asset; starting fresh"
+          fi
+
+      - name: Run budgeted backfill shard
+        run: |
+          mkdir -p data/prevruns
+          touch /tmp/backfill_start
+          python scripts/backfill_previous_runs.py \
+            --shard-id ${{ matrix.shard }} \
+            --total-shards ${{ env.TOTAL_SHARDS }} \
+            --budget ${{ github.event.inputs.budget || '6000' }}
+
+      - name: Keep only files this shard touched
+        # The restored canonical tree contains every shard's stations; upload
+        # only this run's writes or the merge overlay could replace another
+        # shard's fresh files with our stale restored copies.
+        run: find data/prevruns -type f ! -newer /tmp/backfill_start -delete
+
+      - name: Upload shard state
+        uses: actions/upload-artifact@v4
+        with:
+          name: prevruns-shard-${{ matrix.shard }}
+          path: data/prevruns
+          retention-days: 1
+          if-no-files-found: warn
+
+  merge:
+    needs: backfill
+    if: always() && needs.backfill.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore prevruns state from Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/prevruns
+          if gh release download "$RELEASE_TAG" --pattern prevruns.tar.gz --output prevruns.tar.gz 2>/dev/null; then
+            tar -xzf prevruns.tar.gz
+          fi
+
+      - name: Download shard states
+        uses: actions/download-artifact@v4
+        with:
+          path: prevruns_shards
+          pattern: prevruns-shard-*
+
+      - name: Overlay shards
+        # Station sets are disjoint across shards, so newer shard files simply
+        # replace their own previous versions in the canonical tree.
+        run: |
+          for d in prevruns_shards/prevruns-shard-*/; do
+            [ -d "$d" ] && cp -R "$d"/. data/prevruns/
+          done
+          echo "canonical tree: $(find data/prevruns -name '*.csv.gz' | wc -l) station-model files"
+
+      - name: Publish canonical state to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -czf prevruns.tar.gz data/prevruns
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --title "Training data" \
+              --notes "Backfilled Previous-Runs forecasts (data/prevruns tarball, schema in scripts/backfill_previous_runs.py)"
+          gh release upload "$RELEASE_TAG" prevruns.tar.gz --clobber
+          echo "uploaded prevruns.tar.gz ($(du -k prevruns.tar.gz | cut -f1) KB)"

@@ -28,7 +28,10 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    # Normal sharded builds finish well under an hour; met.py's call budget
+    # caps fetch time. A hung shard must die fast — concurrency is
+    # cancel-in-progress:false, so a zombie run blocks every later build.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:

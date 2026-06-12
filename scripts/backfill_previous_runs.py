@@ -266,6 +266,10 @@ def main() -> int:
 
     stations_path = ROOT / "data" / "stations.json"
     stations = json.loads(stations_path.read_text())["stations"]
+    # CONUS first: NBM/HRRR don't cover AK, and NBM is the post-processor's
+    # primary input, so AK stations are the lowest-value budget spend. The
+    # catalogue happens to lead with AK; don't let it eat the early runs.
+    stations.sort(key=lambda s: (s["triplet"].split(":")[1] == "AK", s["triplet"]))
     if args.limit:
         stations = stations[: args.limit]
     if args.total_shards > 1:

@@ -91,8 +91,11 @@ scripts/
   build_static_site.py        Builds dist/ for GitHub Pages
   archive_forecasts.py        Shard step: dist JSON -> archive rows
   merge_shards.py             CI: merge per-shard dist artifacts
-  backfill_previous_runs.py   Open-Meteo Previous-Runs API backfill (resumable)
+  backfill_previous_runs.py   Open-Meteo Previous-Runs API backfill (resumable;
+                              also runs nightly in CI, state on the
+                              training-data Release)
   build_training_data.py      Join backfill + QC targets -> training pairs
+  train_postprocessor.py      Train/evaluate the pooled LightGBM post-processor
   benchmark.py                Held-out MAE evaluation
 tests/                        pytest unit tests (targets, verification, members)
 ```
@@ -118,4 +121,7 @@ tests/                        pytest unit tests (targets, verification, members)
       archive to Release assets, multi-model fetch (NBM/HRRR/GFS/IFS/AIFS),
       `nbm_snow17` member, NWS divergence attribution, Previous-Runs backfill
 - [ ] v1.5: pooled LightGBM post-processor trained on the backfill pairs
+      (training/eval pipeline in place — `app/postproc.py` +
+      `scripts/train_postprocessor.py`; awaiting CONUS backfill coverage,
+      then ensemble-member integration)
 - [ ] v1.6: full snow-water year history overlay (Oct 1 baseline + multi-year climatology band)

@@ -9,6 +9,7 @@ data/cache/
 data/stations.json
 data/prevruns/
 data/training/
+data/models/
 dist/
 logs/
 *.log
