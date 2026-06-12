@@ -44,7 +44,7 @@ NUMERIC_FEATURES = [
     "mm_precip_mean_mm", "mm_precip_std_mm", "mm_n",
     "lead_days", "doy_sin", "doy_cos",
     "elevation_ft", "lat", "lon", "median_slr",
-    "obs_depth_prev_in", "obs_swe_prev_in",
+    "obs_depth_issue_in", "obs_swe_issue_in",
 ]
 CATEGORICAL_FEATURES = ["snow_class", "nbm_version"]
 FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
@@ -62,6 +62,63 @@ LGB_PARAMS = {
     "verbosity": -1,
 }
 NUM_ROUNDS = 600
+
+
+def nbm_version_for(d: str) -> str:
+    """NBM version epoch by valid date (training feature / stratifier)."""
+    if d >= "2026-05-05":
+        return "v5.0"
+    if d >= "2025-05-28":
+        return "v4.3"
+    return "v4.2"
+
+
+def build_inference_features(
+    mm_fcst: pd.DataFrame, *, statics: dict, last_depth: Optional[float],
+    last_swe: Optional[float], issue_date, horizon: int,
+) -> pd.DataFrame:
+    """Pairs-shaped frame (one row per forecast day) from the live multimodel
+    frame, mirroring scripts/build_training_data.py exactly — any drift
+    between the two layouts silently degrades the model.
+
+    mm_fcst columns are `{model}_{snowfall|precip|tmean}` (app/met.py);
+    training columns are `{model}_{snowfall_cm|precip_mm|tmean_c}`.
+    """
+    rows = []
+    for _, r in (mm_fcst if mm_fcst is not None else pd.DataFrame()).iterrows():
+        d = r.get("date")
+        d_iso = d.isoformat() if hasattr(d, "isoformat") else str(d)
+        lead = (pd.Timestamp(d_iso).date() - issue_date).days
+        if lead < 1 or lead > horizon:
+            continue
+        row = {"valid_date": d_iso, "lead_days": lead}
+        for mk in ("nbm", "hrrr", "gfs", "ifs", "aifs"):
+            row[f"{mk}_snowfall_cm"] = r.get(f"{mk}_snowfall")
+            row[f"{mk}_precip_mm"] = r.get(f"{mk}_precip")
+            row[f"{mk}_tmean_c"] = r.get(f"{mk}_tmean")
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    snow_cols = [f"{m}_snowfall_cm" for m in ("nbm", "hrrr", "gfs")]
+    precip_cols = [f"{m}_precip_mm" for m in ("nbm", "hrrr", "gfs", "ifs", "aifs")]
+    for c in snow_cols + precip_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["mm_snow_mean_cm"] = df[snow_cols].mean(axis=1)
+    df["mm_snow_std_cm"] = df[snow_cols].std(axis=1)
+    df["mm_precip_mean_mm"] = df[precip_cols].mean(axis=1)
+    df["mm_precip_std_mm"] = df[precip_cols].std(axis=1)
+    df["mm_n"] = df[precip_cols].notna().sum(axis=1)
+    df["doy"] = pd.to_datetime(df["valid_date"]).dt.dayofyear
+    df["elevation_ft"] = statics.get("elevation_ft")
+    df["lat"] = statics.get("lat")
+    df["lon"] = statics.get("lon")
+    df["median_slr"] = statics.get("median_slr")
+    df["snow_class"] = statics.get("snow_class")
+    df["nbm_version"] = df["valid_date"].map(nbm_version_for)
+    df["obs_depth_issue_in"] = last_depth
+    df["obs_swe_issue_in"] = last_swe
+    return df
 
 
 def usable_rows(pairs: pd.DataFrame) -> pd.DataFrame:

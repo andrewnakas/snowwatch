@@ -11,7 +11,7 @@ Output: data/training/pairs.csv.gz, one row per (station, valid_date, lead):
   gfs_snowfall_cm, gfs_precip_mm, gfs_tmean_c,
   ifs_precip_mm, ifs_tmean_c, aifs_precip_mm, aifs_tmean_c,
   mm_snow_mean_cm, mm_snow_std_cm, mm_precip_mean_mm, mm_precip_std_mm, mm_n,
-  obs_snowfall_in, obs_dswe_in, obs_depth_prev_in, obs_swe_prev_in, quality,
+  obs_snowfall_in, obs_dswe_in, obs_depth_issue_in, obs_swe_issue_in, quality,
   doy, elevation_ft, lat, lon, median_slr, snow_class, nbm_version
 
 Usage:
@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app import snotel, targets  # noqa: E402
+from app.postproc import nbm_version_for  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("bf", ROOT / "scripts" / "backfill_previous_runs.py")
 bf = importlib.util.module_from_spec(_spec)
@@ -41,15 +42,6 @@ _spec.loader.exec_module(bf)
 
 MODEL_KEYS = ("nbm", "hrrr", "gfs", "ifs", "aifs")
 SNOW_MODELS = ("nbm", "hrrr", "gfs")  # models with archived snowfall
-
-
-def nbm_version_for(d: str) -> str:
-    """NBM version epoch by valid date (training feature / stratifier)."""
-    if d >= "2026-05-05":
-        return "v5.0"
-    if d >= "2025-05-28":
-        return "v4.3"
-    return "v4.2"
 
 
 def build_station(st: dict, *, hist_days: int = 900) -> pd.DataFrame | None:
@@ -100,16 +92,21 @@ def build_station(st: dict, *, hist_days: int = 900) -> pd.DataFrame | None:
     obs["valid_date"] = obs["date"].astype(str)
     obs = obs[["valid_date", "obs_snowfall_in", "obs_dswe_in", "quality"]]
 
-    state = pd.DataFrame({
-        "valid_date": hist_qc["date"].astype(str),
-        # Antecedent (previous-day) pack state — known at issue time.
-        "obs_depth_prev_in": hist_qc["snwd_qc"].shift(1),
-        "obs_swe_prev_in": pd.to_numeric(hist_qc["swe_in"], errors="coerce").shift(1),
-    })
-
-    out = fc.merge(obs, on="valid_date", how="inner").merge(state, on="valid_date", how="left")
+    out = fc.merge(obs, on="valid_date", how="inner")
     if out.empty:
         return None
+
+    # Pack state as of ISSUE time (valid_date - lead), not the day before
+    # valid: for lead > 1 the previous-day observation is still in the future
+    # when the forecast is made — training on it would leak state the live
+    # model can never have. At inference all leads share the latest obs.
+    depth_by_date = dict(zip(hist_qc["date"].astype(str), hist_qc["snwd_qc"]))
+    swe_by_date = dict(zip(hist_qc["date"].astype(str),
+                           pd.to_numeric(hist_qc["swe_in"], errors="coerce")))
+    issue = (pd.to_datetime(out["valid_date"])
+             - pd.to_timedelta(out["lead_days"].astype(int), unit="D")).dt.strftime("%Y-%m-%d")
+    out["obs_depth_issue_in"] = issue.map(depth_by_date)
+    out["obs_swe_issue_in"] = issue.map(swe_by_date)
     out["triplet"] = triplet
     out["doy"] = pd.to_datetime(out["valid_date"]).dt.dayofyear
     out["elevation_ft"] = statics.get("elevation_ft")

@@ -111,6 +111,7 @@ tests/                        pytest unit tests (targets, verification, members)
 | `SW_NWS_OFF=1` | Skip api.weather.gov calls (no NWS divergence panel). |
 | `SW_MET_BUDGET` | Per-process weighted Open-Meteo call budget for `app/met.py` (degrades to cache when spent). |
 | `SW_MAE_CACHE_DAYS` | TTL for cached walk-forward member MAEs (default 7; `0` recomputes every build). |
+| `SW_ENABLE_POSTPROC=1` | Enable the `postproc_snowfall` member (also needs trained models in `data/models/`). |
 
 ## Roadmap
 
@@ -122,7 +123,7 @@ tests/                        pytest unit tests (targets, verification, members)
       archive to Release assets, multi-model fetch (NBM/HRRR/GFS/IFS/AIFS),
       `nbm_snow17` member, NWS divergence attribution, Previous-Runs backfill
 - [ ] v1.5: pooled LightGBM post-processor trained on the backfill pairs
-      (training/eval pipeline in place — `app/postproc.py` +
-      `scripts/train_postprocessor.py`; awaiting CONUS backfill coverage,
-      then ensemble-member integration)
+      (training/eval pipeline + gated `postproc_snowfall` ensemble member in
+      place; awaiting CONUS backfill coverage to train for real, then flip
+      `SW_ENABLE_POSTPROC=1`)
 - [ ] v1.6: full snow-water year history overlay (Oct 1 baseline + multi-year climatology band)

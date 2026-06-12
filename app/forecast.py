@@ -229,6 +229,46 @@ def _member_nbm_snow17(
     )
 
 
+def _member_postproc_snowfall(
+    last_depth: float, last_swe: Optional[float], mm_fcst: pd.DataFrame,
+    station: dict, hist_qc: pd.DataFrame, *, today: date, horizon: int,
+) -> List[float]:
+    """Pooled LightGBM post-processed snowfall accumulated onto the pack with
+    the same degree-day melt as nbm_snowfall (v1.5).
+
+    Off unless SW_ENABLE_POSTPROC=1 AND trained models sit in data/models —
+    this member must never ship on smoke-trained weights by accident.
+    """
+    if os.environ.get("SW_ENABLE_POSTPROC") != "1":
+        return []
+    if mm_fcst is None or mm_fcst.empty:
+        return []
+    from . import postproc as _postproc
+    boosters = _postproc.load()
+    if not boosters or "point" not in boosters:
+        return []
+    statics = _targets.station_statics(station, hist_qc)
+    feats = _postproc.build_inference_features(
+        mm_fcst, statics=statics, last_depth=last_depth, last_swe=last_swe,
+        issue_date=today, horizon=horizon)
+    if feats.empty:
+        return []
+    preds = _postproc.predict(boosters, feats)
+    snow_by_lead = dict(zip(feats["lead_days"], preds["point"]))
+    tmean_by_lead = dict(zip(feats["lead_days"],
+                             pd.to_numeric(feats.get("nbm_tmean_c"), errors="coerce")))
+    out: List[float] = []
+    depth = float(last_depth)
+    for h in range(1, horizon + 1):
+        snow_in = float(snow_by_lead.get(h) or 0.0)
+        t = tmean_by_lead.get(h)
+        melt_in = (max(0.0, float(t)) * MELT_FACTOR_IN_PER_DEGC_DAY
+                   if t is not None and np.isfinite(t) and float(t) > FREEZE_THRESHOLD_C else 0.0)
+        depth = max(0.0, depth + snow_in - melt_in)
+        out.append(depth)
+    return out
+
+
 def _member_nbm_snowfall(last_depth: float, nbm_df: pd.DataFrame, horizon: int) -> List[float]:
     """Cumulative NBM snowfall added to last observed depth, with degree-day melt."""
     if nbm_df is None or nbm_df.empty:
@@ -445,6 +485,7 @@ _DECAY_BY_MEMBER = {
     "snow17": 5,
     "nbm_snow17": 5,
     "nbm_snowfall": 6,
+    "postproc_snowfall": 6,
     "ridge_snow": 5,
     "chronos_bolt": 4,
 }
@@ -969,6 +1010,11 @@ def forecast_station(
     if nbm_pred:
         members_raw["nbm_snowfall"] = nbm_pred
 
+    pp_pred = _member_postproc_snowfall(
+        last_depth, last_swe, mm_fcst, station, hist_qc, today=today, horizon=horizon)
+    if pp_pred:
+        members_raw["postproc_snowfall"] = pp_pred
+
     feats, feat_cols = _build_ridge_features(hist, wx_hist, horizon=horizon)
     ridge_pred, ridge_mae_by_h = _member_ridge_snow(feats, feat_cols, horizon=horizon)
     if ridge_pred and len(ridge_pred) >= horizon:
@@ -1021,6 +1067,12 @@ def forecast_station(
         if "nbm_snowfall" in members_raw:
             nbm_mae = _walkforward_nbm_proxy_mae(hist, wx_hist, horizon=horizon)
             rolling_mae["nbm_snowfall"] = nbm_mae if nbm_mae is not None else rolling_mae["persistence_lag1"] * 1.1
+        if "postproc_snowfall" in members_raw:
+            # No live backtest until the forecast archive accumulates; seed
+            # slightly better than nbm_snowfall (the pooled model exists to
+            # beat it) and let continuous verification correct the weight.
+            pp_proxy = rolling_mae.get("nbm_snowfall") or rolling_mae["persistence_lag1"]
+            rolling_mae["postproc_snowfall"] = pp_proxy * 0.9
         if "chronos_bolt" in members_raw:
             c_mae = _walkforward_chronos_mae(depth_series, horizon=horizon)
             rolling_mae["chronos_bolt"] = c_mae if c_mae is not None else rolling_mae["persistence_lag1"] * 0.95
