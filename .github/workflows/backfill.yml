@@ -46,7 +46,10 @@ jobs:
         run: pip install pandas numpy
 
       - name: Refresh SNOTEL station list
-        run: python scripts/fetch_stations.py
+        # AWDB is flaky from runner IPs (returned 0 stations to 3 of 6 jobs
+        # on 2026-06-12). The committed catalogue is the fallback floor;
+        # fetch_stations refuses to overwrite it with a bad pull.
+        run: python scripts/fetch_stations.py || echo "AWDB unreachable; using committed station catalogue"
 
       - name: Restore prevruns state from Release
         env:

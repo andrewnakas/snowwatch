@@ -22,10 +22,21 @@ DIST = ROOT / "dist"
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input-root", required=True, type=Path)
+    ap.add_argument("--min-shards", type=int, default=0,
+                    help="abort (don't deploy) if fewer shards delivered — "
+                         "guards against publishing a mostly-empty site when "
+                         "many runners die at once")
     args = ap.parse_args()
 
-    shard_dirs = sorted(p for p in args.input_root.iterdir() if p.is_dir())
+    shard_dirs = sorted(
+        p for p in args.input_root.iterdir()
+        if p.is_dir() and (p / "forecasts").exists()
+    )
     print(f"merging {len(shard_dirs)} shard dirs into {DIST}")
+    if args.min_shards and len(shard_dirs) < args.min_shards:
+        print(f"ERROR: only {len(shard_dirs)} shards delivered forecasts "
+              f"(need >= {args.min_shards}); refusing to deploy a partial site")
+        return 1
 
     if DIST.exists():
         shutil.rmtree(DIST)

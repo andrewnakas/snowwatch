@@ -71,7 +71,9 @@ jobs:
         # is small and the in-module disk cache makes the second-through-Nth
         # call free. Doing this here avoids cross-shard race conditions where
         # shards 1..N start before shard 0 has finished writing the file.
-        run: python scripts/fetch_stations.py
+        # AWDB is flaky from runner IPs; fetch_stations refuses to overwrite
+        # the committed catalogue with a bad pull, so fall back to it.
+        run: python scripts/fetch_stations.py || echo "AWDB unreachable; using committed station catalogue"
 
       - name: Decide ensemble fetch window
         # Member-level ensemble pulls are the heaviest Open-Meteo calls; do
@@ -111,11 +113,12 @@ jobs:
 
   merge:
     needs: build
-    # Deploy whatever shards delivered: a single evicted runner (it happens —
-    # shard 5 got a shutdown signal mid-build on 2026-06-12) must not take
-    # down the whole site update. Missing shards' stations 404 until the
-    # next 6h build; that beats serving a site-wide stale deploy.
-    if: always() && needs.build.result != 'cancelled'
+    # Deploy whatever shards delivered. A single evicted runner (it happens —
+    # shards 5/6 got shutdown signals on 2026-06-12) concludes "cancelled",
+    # which fails `needs.build.result != 'cancelled'`; use the `cancelled()`
+    # status function instead, which is true ONLY when the whole workflow was
+    # cancelled by a human, not when GitHub evicts one matrix runner.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -131,7 +134,9 @@ jobs:
           pattern: dist-shard-*
 
       - name: Merge shards
-        run: python scripts/merge_shards.py --input-root shard_dists
+        # --min-shards guards against deploying a mostly-empty site when many
+        # shards die at once (a real outage, not a stray eviction).
+        run: python scripts/merge_shards.py --input-root shard_dists --min-shards 5
 
       - name: Append forecast archive to monthly Release asset
         # Headerless gzip CSV streams are byte-appendable; the monthly asset
@@ -161,6 +166,9 @@ jobs:
 
   deploy:
     needs: merge
+    # merge runs under !cancelled(); deploy must use the same gate or it is
+    # skipped whenever an evicted runner made `merge`'s upstream "cancelled".
+    if: ${{ !cancelled() && needs.merge.result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: github-pages
