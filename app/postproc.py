@@ -143,8 +143,21 @@ def build_features(pairs: pd.DataFrame) -> pd.DataFrame:
     return df[FEATURES]
 
 
+# Snowfall is a zero-inflated continuous target: >90% of station-days are
+# zero, with a heavy positive tail. An L1/L2 point objective collapses to
+# predicting ~0 everywhere — it minimizes mean error by winning the no-snow
+# majority while being useless on the event days that actually matter (the
+# 24-station pilot showed MAE 0.12 but CSI@1in ~0.03). Tweedie is the
+# textbook objective for this regime (compound Poisson-Gamma), so it is the
+# production point model. We still fit an L1 head for an apples-to-MAE
+# comparison in the scorecard, but the blend should consume `point`.
+POINT_OBJECTIVE = "tweedie"
+TWEEDIE_VARIANCE_POWER = 1.3   # 1->Poisson, 2->Gamma; ~1.3 fits precip-like tails
+
+
 def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROUNDS) -> dict:
-    """Train quantile boosters + an L1 point booster. Returns {name: Booster}.
+    """Train quantile boosters + a Tweedie point booster (+ an L1 head for
+    comparison). Returns {name: Booster} with `point` = the production model.
 
     `pairs` must already be filtered to usable rows and to the training
     period — temporal splitting is the caller's job (see
@@ -161,9 +174,18 @@ def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROU
     for q in quantiles:
         params = dict(LGB_PARAMS, alpha=q)
         out[f"q{int(q * 100)}"] = lgb.train(params, dset, num_boost_round=num_rounds)
-    params = dict(LGB_PARAMS, objective="l1", metric="l1")
-    params.pop("alpha", None)
-    out["point"] = lgb.train(params, dset, num_boost_round=num_rounds)
+
+    # Production point model: Tweedie (handles the zero-inflated tail).
+    tw_params = dict(LGB_PARAMS, objective="tweedie", metric="tweedie",
+                     tweedie_variance_power=TWEEDIE_VARIANCE_POWER)
+    tw_params.pop("alpha", None)
+    out["point"] = lgb.train(tw_params, dset, num_boost_round=num_rounds)
+
+    # Diagnostic L1 head — kept so the scorecard can show the MAE-optimal
+    # model's CSI collapse next to Tweedie's. Not used in production.
+    l1_params = dict(LGB_PARAMS, objective="l1", metric="l1")
+    l1_params.pop("alpha", None)
+    out["point_l1"] = lgb.train(l1_params, dset, num_boost_round=num_rounds)
     return out
 
 

@@ -64,13 +64,17 @@ def main() -> int:
     preds = postproc.predict(boosters, test_df)
 
     ev = test_df.copy()
-    ev["postproc"] = preds["point"]
+    ev["postproc"] = preds["point"]               # Tweedie (production)
+    if "point_l1" in preds.columns:
+        ev["postproc_l1"] = preds["point_l1"]     # diagnostic MAE-optimal head
     ev["nbm_raw"] = pd.to_numeric(ev.get("nbm_snowfall_cm"), errors="coerce") * CM_TO_IN
     ev["mm_mean"] = pd.to_numeric(ev.get("mm_snow_mean_cm"), errors="coerce") * CM_TO_IN
 
     metrics: dict = {"cutoff": cutoff, "n_train": len(train_df), "n_test": len(test_df),
                      "n_stations": int(pairs["triplet"].nunique()), "sources": {}}
-    for src in ("postproc", "nbm_raw", "mm_mean"):
+    sources = ["postproc"] + (["postproc_l1"] if "postproc_l1" in ev.columns else []) \
+        + ["nbm_raw", "mm_mean"]
+    for src in sources:
         sub = ev[ev[src].notna()]
         m = verification.summarize_deterministic(sub, obs_col="obs_snowfall_in", pred_col=src)
         by_lead = {}
@@ -82,8 +86,9 @@ def main() -> int:
             print(f"{src:>9}: no rows (model not in backfill coverage yet)")
             continue
         fmt = lambda v, spec="0.3f": format(v, spec) if v is not None else "n/a"  # noqa: E731
-        print(f"{src:>9}: n={m['n']} mae={fmt(m['mae'])} bias={fmt(m['bias'], '+.3f')} "
-              f"event_mae={fmt(m['event_mae'])} csi_1in={fmt(m['csi_1in'])}")
+        print(f"{src:>12}: n={m['n']} mae={fmt(m['mae'])} bias={fmt(m['bias'], '+.3f')} "
+              f"event_mae={fmt(m['event_mae'])} "
+              f"csi_1in={fmt(m['csi_1in'])} csi_2in={fmt(m['csi_2in'])} pod_1in={fmt(m['pod_1in'])}")
 
     qcols = sorted((c for c in preds.columns if c.startswith("q")), key=lambda c: int(c[1:]))
     crps = verification.crps_from_quantiles(
