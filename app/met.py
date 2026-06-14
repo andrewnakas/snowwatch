@@ -76,7 +76,9 @@ ENSEMBLE_MODELS = "gfs025,ecmwf_aifs025"
 ENSEMBLE_VARS = ("snowfall_sum", "precipitation_sum")
 
 PROFILE_LEVELS = (1000, 925, 850, 700, 600, 500)
-PROFILE_VARS = ("temperature", "wind_speed", "geopotential_height")
+# relative_humidity is the key addition: with temperature it gives wet-bulb
+# (phase) and locates RH-weighted crystal growth in the dendritic zone (SLR).
+PROFILE_VARS = ("temperature", "relative_humidity", "wind_speed", "geopotential_height")
 
 # ---------- call budget ------------------------------------------------------
 # Open-Meteo's free tier weights a call by variables×days×models. These are
