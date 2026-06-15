@@ -81,3 +81,59 @@ class TestNbmVersion:
         assert postproc.nbm_version_for("2025-05-01") == "v4.2"
         assert postproc.nbm_version_for("2025-05-28") == "v4.3"
         assert postproc.nbm_version_for("2026-05-05") == "v5.0"
+
+
+class _ConstBooster:
+    """Minimal stand-in for a lgb.Booster: returns a fixed per-row value."""
+    def __init__(self, value):
+        self.value = value
+
+    def predict(self, X):
+        return np.full(len(X), self.value, dtype=float)
+
+
+class TestHurdleGating:
+    """The production `point` is the hurdle combination of amount + psnow.
+    Verified deterministically with constant fake boosters — no training."""
+
+    def _pairs(self, n=3):
+        # build_features only needs the columns it coerces; an empty-ish frame
+        # with the right length is enough for the const boosters.
+        return pd.DataFrame({"doy": [1] * n, "obs_snowfall_in": [0.0] * n})
+
+    def test_likely_event_underforecast_is_floored(self):
+        # amount below threshold but psnow above gate -> floored to threshold.
+        b = {"amount": _ConstBooster(0.2),
+             "psnow": _ConstBooster(postproc.HURDLE_GATE + 0.1)}
+        out = postproc.predict(b, self._pairs())
+        assert np.allclose(out["point"], postproc.EVENT_THRESHOLD_IN)
+        assert np.allclose(out["amount"], 0.2)  # raw amount preserved
+
+    def test_unlikely_event_not_floored(self):
+        # psnow below gate -> amount passes through untouched.
+        b = {"amount": _ConstBooster(0.2),
+             "psnow": _ConstBooster(postproc.HURDLE_GATE - 0.1)}
+        out = postproc.predict(b, self._pairs())
+        assert np.allclose(out["point"], 0.2)
+
+    def test_confident_amount_not_lowered(self):
+        # amount already above threshold -> gate never lowers it.
+        b = {"amount": _ConstBooster(5.0),
+             "psnow": _ConstBooster(0.9)}
+        out = postproc.predict(b, self._pairs())
+        assert np.allclose(out["point"], 5.0)
+
+    def test_no_psnow_falls_back_to_amount(self):
+        # Older saved models without the occurrence head still work.
+        b = {"amount": _ConstBooster(0.2)}
+        out = postproc.predict(b, self._pairs())
+        assert "psnow" not in out.columns
+        assert np.allclose(out["point"], 0.2)
+
+    def test_gate_override(self):
+        b = {"amount": _ConstBooster(0.2), "psnow": _ConstBooster(0.5)}
+        # gate above psnow -> no floor
+        assert np.allclose(postproc.predict(b, self._pairs(), gate=0.6)["point"], 0.2)
+        # gate below psnow -> floor
+        assert np.allclose(postproc.predict(b, self._pairs(), gate=0.4)["point"],
+                           postproc.EVENT_THRESHOLD_IN)

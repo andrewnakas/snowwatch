@@ -146,13 +146,20 @@ def build_features(pairs: pd.DataFrame) -> pd.DataFrame:
 # Snowfall is a zero-inflated continuous target: >90% of station-days are
 # zero, with a heavy positive tail. An L1/L2 point objective collapses to
 # predicting ~0 everywhere — it minimizes mean error by winning the no-snow
-# majority while being useless on the event days that actually matter (the
-# 24-station pilot showed MAE 0.12 but CSI@1in ~0.03). Tweedie is the
-# textbook objective for this regime (compound Poisson-Gamma), so it is the
-# production point model. We still fit an L1 head for an apples-to-MAE
-# comparison in the scorecard, but the blend should consume `point`.
-POINT_OBJECTIVE = "tweedie"
+# majority while being useless on the event days that actually matter.
+#
+# HURDLE (two-part) model: a single regressor — even Tweedie — trades event
+# detection for MAE (raising tweedie_variance_power lowers MAE but DROPS POD;
+# verified by sweep 2026-06-14). The fix is to separate the two questions:
+#   psnow   — binary classifier: P(snowfall >= EVENT_THRESHOLD_IN)
+#   amount  — Tweedie regressor: how much snow, given the column
+# The production `point` gates the amount by psnow: when an event is likely
+# but the regressor under-calls it, floor the call at the event threshold.
+# This recovers POD (0.25 -> 0.40 @ p>=0.3) and CSI (0.22 -> 0.28) for a
+# negligible MAE cost — the right tradeoff for snow (miss < false alarm).
 TWEEDIE_VARIANCE_POWER = 1.3   # 1->Poisson, 2->Gamma; ~1.3 fits precip-like tails
+EVENT_THRESHOLD_IN = 1.0       # what counts as a "snow event" for the classifier
+HURDLE_GATE = 0.3              # psnow above this floors the call at EVENT_THRESHOLD_IN
 
 
 def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROUNDS) -> dict:
@@ -175,31 +182,66 @@ def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROU
         params = dict(LGB_PARAMS, alpha=q)
         out[f"q{int(q * 100)}"] = lgb.train(params, dset, num_boost_round=num_rounds)
 
-    # Production point model: Tweedie (handles the zero-inflated tail).
+    # Amount head: Tweedie regressor (handles the zero-inflated tail).
     tw_params = dict(LGB_PARAMS, objective="tweedie", metric="tweedie",
                      tweedie_variance_power=TWEEDIE_VARIANCE_POWER)
     tw_params.pop("alpha", None)
-    out["point"] = lgb.train(tw_params, dset, num_boost_round=num_rounds)
+    out["amount"] = lgb.train(tw_params, dset, num_boost_round=num_rounds)
+
+    # Occurrence head: P(snowfall >= EVENT_THRESHOLD_IN). Drives the hurdle
+    # gate and is itself a calibrated event-probability output for the UI.
+    clf_label = (y.to_numpy() >= EVENT_THRESHOLD_IN).astype(int)
+    cdset = lgb.Dataset(X, label=clf_label, categorical_feature=CATEGORICAL_FEATURES,
+                        free_raw_data=False)
+    clf_params = dict(LGB_PARAMS, objective="binary", metric="binary_logloss")
+    clf_params.pop("alpha", None)
+    out["psnow"] = lgb.train(clf_params, cdset, num_boost_round=num_rounds)
 
     # Diagnostic L1 head — kept so the scorecard can show the MAE-optimal
-    # model's CSI collapse next to Tweedie's. Not used in production.
+    # model's CSI collapse next to the hurdle model. Not used in production.
     l1_params = dict(LGB_PARAMS, objective="l1", metric="l1")
     l1_params.pop("alpha", None)
     out["point_l1"] = lgb.train(l1_params, dset, num_boost_round=num_rounds)
     return out
 
 
-def predict(boosters: dict, pairs: pd.DataFrame) -> pd.DataFrame:
-    """Predictions per row: point + one column per quantile, snowfall clamped
-    at zero and quantiles re-sorted (quantile GBMs can cross)."""
+def predict(boosters: dict, pairs: pd.DataFrame, *, gate: float = HURDLE_GATE) -> pd.DataFrame:
+    """Predictions per row. Columns:
+      amount  — raw Tweedie regressor output (>=0)
+      psnow   — P(snow event), if the occurrence head is present
+      point   — production prediction: the hurdle combination of the two
+      q10/q50/q90 — quantile members (clamped >=0, re-sorted; GBMs can cross)
+
+    The hurdle: where an event is likely (psnow >= gate) but the regressor
+    under-calls it (amount < EVENT_THRESHOLD_IN), floor the call at the
+    threshold. Recovers POD/CSI the regressor alone gives up. With no psnow
+    head (older saved models) `point` falls back to `amount`.
+    """
     X = build_features(pairs)
+    raw = {name: bst.predict(X) for name, bst in boosters.items()}
     out = pd.DataFrame(index=pairs.index)
-    for name, bst in boosters.items():
-        out[name] = np.maximum(0.0, bst.predict(X))
+
+    amount = np.maximum(0.0, raw.get("amount", raw.get("point", np.zeros(len(pairs)))))
+    out["amount"] = amount
+    if "psnow" in raw:
+        psnow = raw["psnow"]
+        out["psnow"] = psnow
+        point = np.where((psnow >= gate) & (amount < EVENT_THRESHOLD_IN),
+                         EVENT_THRESHOLD_IN, amount)
+        out["point"] = np.maximum(0.0, point)
+    else:
+        out["point"] = amount
+
+    for name in ("q10", "q50", "q90"):
+        if name in raw:
+            out[name] = np.maximum(0.0, raw[name])
     qcols = sorted((c for c in out.columns if c.startswith("q")),
                    key=lambda c: int(c[1:]))
     if len(qcols) > 1:
         out[qcols] = np.sort(out[qcols].to_numpy(), axis=1)
+
+    if "point_l1" in raw:
+        out["point_l1"] = np.maximum(0.0, raw["point_l1"])
     return out
 
 

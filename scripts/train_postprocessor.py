@@ -97,6 +97,25 @@ def main() -> int:
     metrics["crps_postproc"] = crps
     print(f"postproc CRPS (from {qcols}): {crps:.3f}" if crps is not None else "CRPS: n/a")
 
+    # Occurrence head calibration: Brier score + a 5-bin reliability table for
+    # P(snow >= EVENT_THRESHOLD_IN). A well-calibrated psnow is what makes the
+    # hurdle gate trustworthy and is a UI-facing probability in its own right.
+    if "psnow" in preds.columns:
+        p = preds["psnow"].to_numpy()
+        occ = (ev["obs_snowfall_in"].to_numpy() >= postproc.EVENT_THRESHOLD_IN).astype(float)
+        brier = float(np.mean((p - occ) ** 2))
+        edges = np.linspace(0, 1, 6)
+        rel = []
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            m = (p >= lo) & (p < hi if hi < 1 else p <= hi)
+            if m.any():
+                rel.append({"bin": f"{lo:.1f}-{hi:.1f}", "n": int(m.sum()),
+                            "pred": round(float(p[m].mean()), 3),
+                            "obs": round(float(occ[m].mean()), 3)})
+        metrics["psnow"] = {"brier": brier, "reliability": rel}
+        print(f"psnow Brier={brier:.4f}  reliability(pred->obs): "
+              + " ".join(f"{r['pred']}->{r['obs']}(n{r['n']})" for r in rel))
+
     # Head-to-head on rows where both exist, blocked by station-week.
     head = ev[ev["postproc"].notna() & ev["nbm_raw"].notna()].copy()
     if not head.empty:
