@@ -23,20 +23,21 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TOTAL_SHARDS: 8
+  TOTAL_SHARDS: 4
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Ensemble-hour builds legitimately run 2-4h per shard (per-station
-    # member pulls + NWS round-trips on flaky runner DNS). 300 still kills
-    # true zombies before they block the next 6h build forever (concurrency
-    # is cancel-in-progress:false).
+    # 4 fat shards, not 8 thin ones: on the free-tier runner budget a build
+    # only completes when ALL its shards get runners at once. 8 parallel jobs
+    # rarely schedule together, so builds sat queued for hours and overlapped
+    # the next 6h run (2026-06-15). 4 shards schedule reliably; each does ~2x
+    # the stations (~230) at ~75-120 min, well under the timeout.
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
 
@@ -135,8 +136,9 @@ jobs:
 
       - name: Merge shards
         # --min-shards guards against deploying a mostly-empty site when many
-        # shards die at once (a real outage, not a stray eviction).
-        run: python scripts/merge_shards.py --input-root shard_dists --min-shards 5
+        # shards die at once (a real outage, not a stray eviction). With
+        # TOTAL_SHARDS=4, require 3 (one stray eviction tolerated).
+        run: python scripts/merge_shards.py --input-root shard_dists --min-shards 3
 
       - name: Append forecast archive to monthly Release asset
         # Headerless gzip CSV streams are byte-appendable; the monthly asset
