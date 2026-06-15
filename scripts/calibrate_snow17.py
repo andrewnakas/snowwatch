@@ -34,7 +34,9 @@ from app import snotel, snow17 as _snow17, snow17_calibrate as _cal, weather  # 
 
 
 def _load_stations(path: Path) -> list[dict]:
-    return json.loads(path.read_text())
+    # stations.json is {"stations": [...]}; tolerate a bare list too.
+    obj = json.loads(path.read_text())
+    return obj["stations"] if isinstance(obj, dict) else obj
 
 
 def main() -> int:
