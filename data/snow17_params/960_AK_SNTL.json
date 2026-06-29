@@ -1,0 +1,1 @@
+{"triplet":"960:AK:SNTL","fitted_at":1782735227.3893683,"n_rows":700,"first_date":"2024-06-18","last_date":"2026-06-28","base_params":{"MFMAX":1.05,"MFMIN":0.6,"UADJ":0.04,"PXTEMP":1.0},"params":{"MFMAX":0.5,"MFMIN":0.05,"UADJ":0.01,"PXTEMP":3.0},"loss_base":16.28945347483858,"loss_fit":15.906196498781561}
