@@ -1,0 +1,12 @@
+# Training/backfill-only dependencies (local Mac; NOT installed in the 6h
+# site CI — keep the pages workflow lean). requirements.txt stays the
+# runtime set.
+-r requirements.txt
+lightgbm>=4.3
+scikit-learn>=1.4
+xarray>=2024.1
+zarr>=2.16
+fsspec>=2024.2
+aiohttp>=3.9
+requests>=2.31
+beautifulsoup4>=4.12

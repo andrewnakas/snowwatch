@@ -66,10 +66,14 @@ jobs:
         run: |
           mkdir -p data/prevruns
           touch /tmp/backfill_start
+          # Model-major priority order: NBM (primary feature + baseline) to
+          # full coverage first. gfs is last — its bulk history now comes from
+          # the dynamical.org Zarr archive (scripts/backfill_gfs_zarr.py).
           python scripts/backfill_previous_runs.py \
             --shard-id ${{ matrix.shard }} \
             --total-shards ${{ env.TOTAL_SHARDS }} \
             --budget ${{ github.event.inputs.budget || '6000' }} \
+            --models nbm,hrrr,ifs,aifs \
             --max-seconds 5400
 
       - name: Keep only files this shard touched

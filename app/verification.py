@@ -177,4 +177,135 @@ def summarize_deterministic(
         out[f"csi_{thr:g}in"] = c["csi"]
         out[f"pod_{thr:g}in"] = c["pod"]
         out[f"far_{thr:g}in"] = c["far"]
+        out[f"fb_{thr:g}in"] = c["freq_bias"]
+    return out
+
+
+def reliability_curve(y_true, prob_fcst, *, threshold_in: float,
+                      n_bins: int = 5) -> list[dict]:
+    """Reliability table for P(snowfall >= threshold): per probability bin,
+    mean forecast probability vs observed event frequency. A calibrated
+    forecast has pred ≈ obs in every bin (slope ~1 on the diagram)."""
+    t = np.asarray(y_true, dtype=float)
+    p = np.asarray(prob_fcst, dtype=float)
+    ok = np.isfinite(t) & np.isfinite(p)
+    t, p = t[ok], p[ok]
+    occ = (t >= threshold_in).astype(float)
+    edges = np.linspace(0, 1, n_bins + 1)
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (p >= lo) & (p < hi if hi < 1 else p <= hi)
+        if m.any():
+            rows.append({"bin": f"{lo:.1f}-{hi:.1f}", "n": int(m.sum()),
+                         "pred": round(float(p[m].mean()), 3),
+                         "obs": round(float(occ[m].mean()), 3)})
+    return rows
+
+
+def performance_diagram_points(
+    df: pd.DataFrame, *, obs_col: str, pred_cols: Iterable[str],
+    thresholds: Iterable[float] = EVENT_THRESHOLDS_IN,
+) -> list[dict]:
+    """POD vs success ratio (1−FAR) per source and threshold — the points of
+    a Roebber performance diagram. CSI isopleths belong to the plot layer."""
+    pts = []
+    for src in pred_cols:
+        sub = df[df[src].notna()]
+        for thr in thresholds:
+            c = csi_pod_far(sub[obs_col], sub[src], threshold_in=thr)
+            sr = None if c["far"] is None else 1.0 - c["far"]
+            pts.append({"source": src, "threshold_in": thr, "pod": c["pod"],
+                        "sr": sr, "csi": c["csi"], "freq_bias": c["freq_bias"],
+                        "n": c["n"]})
+    return pts
+
+
+def block_bootstrap_stat(
+    df: pd.DataFrame, stat_fn, *,
+    station_col: str = "triplet", date_col: str = "valid_date",
+    n_boot: int = 1000, seed: int = 0,
+) -> dict:
+    """Block bootstrap of an arbitrary statistic, resampling station-weeks.
+
+    stat_fn(sub_df) -> float is recomputed on each resample (rows repeated
+    per block draw), so it works for non-linear statistics — CSI/POD deltas,
+    BSS, CRPS differences — where paired_block_bootstrap's mean-|err| algebra
+    doesn't apply. Returns the full-sample point estimate, a 95% percentile
+    CI, and P(stat < 0) / P(stat > 0) over resamples.
+    """
+    d = df.copy()
+    if d.empty:
+        return {"stat": None, "ci_lo": None, "ci_hi": None,
+                "p_lt_0": None, "p_gt_0": None, "n": 0, "n_blocks": 0}
+    week = pd.to_datetime(d[date_col]).dt.strftime("%G-%V")
+    codes, _ = pd.factorize(d[station_col].astype(str) + "_" + week)
+    order = np.argsort(codes, kind="stable")
+    sorted_codes = codes[order]
+    starts = np.flatnonzero(np.r_[True, np.diff(sorted_codes) != 0])
+    bounds = np.r_[starts, len(sorted_codes)]
+    idx_by_block = [order[bounds[i]:bounds[i + 1]] for i in range(len(starts))]
+    n_blocks = len(idx_by_block)
+    rng = np.random.default_rng(seed)
+    stats = np.empty(n_boot)
+    for i in range(n_boot):
+        pick = rng.integers(0, n_blocks, n_blocks)
+        rows = np.concatenate([idx_by_block[j] for j in pick])
+        stats[i] = stat_fn(d.iloc[rows])
+    stats = stats[np.isfinite(stats)]
+    if stats.size == 0:
+        return {"stat": float(stat_fn(d)), "ci_lo": None, "ci_hi": None,
+                "p_lt_0": None, "p_gt_0": None, "n": int(len(d)),
+                "n_blocks": int(n_blocks)}
+    return {
+        "stat": float(stat_fn(d)),
+        "ci_lo": float(np.percentile(stats, 2.5)),
+        "ci_hi": float(np.percentile(stats, 97.5)),
+        "p_lt_0": float(np.mean(stats < 0)),
+        "p_gt_0": float(np.mean(stats > 0)),
+        "n": int(len(d)),
+        "n_blocks": int(n_blocks),
+    }
+
+
+def crpss(crps_fcst: Optional[float], crps_ref: Optional[float]) -> Optional[float]:
+    """CRPS skill score vs a reference (climatology): 1 − CRPS/CRPS_ref."""
+    if crps_fcst is None or crps_ref is None or crps_ref <= 0:
+        return None
+    return float(1.0 - crps_fcst / crps_ref)
+
+
+def climatology_quantiles(
+    train_df: pd.DataFrame, test_df: pd.DataFrame, *,
+    obs_col: str = "obs_snowfall_in", station_col: str = "triplet",
+    date_col: str = "valid_date", q_levels: Iterable[float] = (0.1, 0.5, 0.9),
+) -> np.ndarray:
+    """Per-(station, month) empirical quantiles of training-period obs,
+    aligned to test rows — the climatology reference forecaster for CRPSS.
+
+    Month buckets, not day-of-year: with a couple of winters per station,
+    DOY cells are too thin to hold a quantile. Fallback: station-all-months,
+    then global. Rows in the returned (n_test, n_levels) matrix line up with
+    test_df row order.
+    """
+    levels = list(q_levels)
+
+    def month_of(s: pd.Series) -> pd.Series:
+        return pd.to_datetime(s).dt.month
+
+    tr = train_df[[station_col, date_col, obs_col]].dropna().copy()
+    tr["_m"] = month_of(tr[date_col])
+    by_sm = tr.groupby([station_col, "_m"])[obs_col].apply(
+        lambda x: np.quantile(x, levels) if len(x) >= 20 else None)
+    by_s = tr.groupby(station_col)[obs_col].apply(
+        lambda x: np.quantile(x, levels) if len(x) >= 20 else None)
+    global_q = np.quantile(tr[obs_col], levels) if len(tr) else np.zeros(len(levels))
+
+    te_station = test_df[station_col].to_numpy()
+    te_month = month_of(test_df[date_col]).to_numpy()
+    out = np.empty((len(test_df), len(levels)))
+    for i, (s, m) in enumerate(zip(te_station, te_month)):
+        q = by_sm.get((s, m))
+        if q is None:
+            q = by_s.get(s)
+        out[i] = q if q is not None else global_q
     return out

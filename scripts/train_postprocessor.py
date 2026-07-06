@@ -10,12 +10,23 @@ Scorecard compares, per lead and overall:
   nbm_raw    — NBM snowfall verbatim (the baseline to beat)
   mm_mean    — multi-model consensus mean
 
-with MAE/bias, event-conditional MAE, CSI at operational thresholds, CRPS
-from the quantile members, and a paired station-week block bootstrap on
-postproc-vs-NBM (the "beats NBM" arbiter).
+with MAE/bias, event-conditional MAE, CSI/POD/FAR/frequency-bias at
+operational thresholds, CRPS from the quantile members (+ CRPSS vs a
+per-station-month climatology), and paired station-week block bootstraps
+on postproc-vs-NBM (the "beats NBM" arbiter).
+
+Modes:
+  default   — single temporal cutoff; trains, scores, saves models+metrics.
+  --folds   — named temporal folds, evaluation only (no models saved):
+                A_core_winter  train < 2025-11-30, test Dec 2025–Feb 2026
+                B_spring       train < 2026-02-28, test ≥ 2026-02-28
+              Fold A is the fold of record: a melt-season-only test window
+              (the old default) starves event stats of positives and lets a
+              low-bias model look better than it is.
 
 Usage:
     python scripts/train_postprocessor.py [--pairs PATH] [--cutoff YYYY-MM-DD]
+    python scripts/train_postprocessor.py --folds
 """
 from __future__ import annotations
 
@@ -30,9 +41,206 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app import postproc, verification  # noqa: E402
+from app import calibration, postproc, verification  # noqa: E402
 
 CM_TO_IN = 1.0 / 2.54
+
+# Days carved off the END of the training period for isotonic calibration +
+# gate tuning. The final boosters are trained WITHOUT these days (standard
+# split-calibration); the tail must never touch the test period.
+CAL_TAIL_DAYS = 60
+
+# Temporal folds for --folds mode. Fold A (core winter) is the fold of
+# record for every "beats NBM" gate; Fold B preserves continuity with the
+# original 2026-02-28 cutoff (test = melt season, kept as the cautionary
+# comparison, not as evidence).
+FOLDS = {
+    # cal_start/cal_end: season-matched calibration windows — the test window
+    # shifted back one year. A last-60-days tail (Oct–Nov for fold A) holds
+    # almost no 6in+ events, so isotonic curves and gates at rare thresholds
+    # were fit on nothing (verified 2026-07-06: 6in reliability 0.23->0.45,
+    # i.e. badly underconfident). The boosters never see the cal window.
+    "A_core_winter": {"train_end": "2025-11-30",
+                      "test_start": "2025-12-01", "test_end": "2026-02-28",
+                      "cal_start": "2024-12-01", "cal_end": "2025-02-28"},
+    "B_spring": {"train_end": "2026-02-28",
+                 "test_start": "2026-02-28", "test_end": None,
+                 "cal_start": "2025-02-28", "cal_end": "2025-06-14"},
+}
+
+
+def _fmt(v, spec="0.3f"):
+    return format(v, spec) if v is not None else "n/a"
+
+
+def fit_calibration(boosters: dict, cal_df: pd.DataFrame) -> dict:
+    """Isotonic curves + tuned gates from the calibration tail.
+
+    Curves are fit on the monotone UNcalibrated probabilities that predict()
+    emits without a calib payload — the same transform inference applies
+    before the curves, so fit and apply see identical inputs.
+    """
+    raw_preds = postproc.predict(boosters, cal_df, calib=None)
+    y = pd.to_numeric(cal_df["obs_snowfall_in"], errors="coerce").to_numpy()
+    leads = pd.to_numeric(cal_df["lead_days"], errors="coerce").to_numpy()
+    iso: dict = {}
+    gates: dict = {}
+    for thr in postproc.EVENT_THRESHOLDS:
+        col = f"p{thr:g}"
+        if col not in raw_preds.columns:
+            continue
+        key = f"{thr:g}"
+        p_raw = raw_preds[col].to_numpy()
+        curve = calibration.fit_isotonic(p_raw, y >= thr)
+        iso[key] = curve
+        p_cal = calibration.apply_isotonic(p_raw, curve)
+        gates[key] = calibration.tune_gate(p_cal, y, leads, threshold_in=thr)
+    return {"iso": iso, "gates": gates,
+            "cal_rows": int(len(cal_df)),
+            "cal_start": str(cal_df["valid_date"].min()),
+            "cal_end": str(cal_df["valid_date"].max())}
+
+
+def evaluate_split(train_df: pd.DataFrame, test_df: pd.DataFrame, *,
+                   label: str, n_boot: int = 1000,
+                   cal_window: tuple[str, str] | None = None) -> tuple[dict, dict, dict | None]:
+    """Train on train_df (minus a calibration slice), calibrate on the slice,
+    score on test_df. Returns (metrics, boosters, calib).
+
+    cal_window (start, end): season-matched calibration slice cut out of the
+    training period (boosters train around the hole). Default: the last
+    CAL_TAIL_DAYS of the training period."""
+    print(f"\n=== {label}: train {len(train_df)} rows "
+          f"(<= {train_df['valid_date'].max()}) / test {len(test_df)} rows "
+          f"({test_df['valid_date'].min()} .. {test_df['valid_date'].max()}) ===")
+    if cal_window:
+        cal_start, cal_end = cal_window
+        in_cal = (train_df["valid_date"] >= cal_start) & (train_df["valid_date"] <= cal_end)
+    else:
+        cal_start = (pd.to_datetime(train_df["valid_date"]).max()
+                     - pd.Timedelta(days=CAL_TAIL_DAYS)).strftime("%Y-%m-%d")
+        in_cal = train_df["valid_date"] >= cal_start
+    inner_df = train_df[~in_cal]
+    cal_df = train_df[in_cal]
+    if inner_df.empty or len(cal_df) < 500:
+        inner_df, cal_df = train_df, train_df.iloc[0:0]
+    boosters = postproc.train(inner_df)
+    calib = None
+    if not cal_df.empty and any(k.startswith("exc_") for k in boosters):
+        calib = fit_calibration(boosters, cal_df)
+        for thr_key, by_bucket in calib["gates"].items():
+            desc = " ".join(
+                f"{b}:{(g['gate'] if g['gate'] is not None else '-')}"
+                for b, g in by_bucket.items())
+            print(f"  gates @{thr_key}in  {desc}")
+    preds = postproc.predict(boosters, test_df, calib=calib)
+
+    ev = test_df.copy()
+    ev["postproc"] = preds["point"]               # Tweedie+hurdle (production)
+    if "point_l1" in preds.columns:
+        ev["postproc_l1"] = preds["point_l1"]     # diagnostic MAE-optimal head
+    ev["nbm_raw"] = pd.to_numeric(ev.get("nbm_snowfall_cm"), errors="coerce") * CM_TO_IN
+    ev["mm_mean"] = pd.to_numeric(ev.get("mm_snow_mean_cm"), errors="coerce") * CM_TO_IN
+
+    obs = ev["obs_snowfall_in"]
+    event_rate_1in = float((pd.to_numeric(obs, errors="coerce") >= 1.0).mean())
+    metrics: dict = {
+        "label": label,
+        "n_train": len(train_df), "n_test": len(test_df),
+        "n_inner_train": len(inner_df), "n_cal": len(cal_df),
+        "cal_start": cal_start if not cal_df.empty else None,
+        "n_stations": int(pd.concat([train_df, test_df])["triplet"].nunique()),
+        "test_event_rate_1in": event_rate_1in,
+        "sources": {},
+    }
+    sources = ["postproc"] + (["postproc_l1"] if "postproc_l1" in ev.columns else []) \
+        + ["nbm_raw", "mm_mean"]
+    for src in sources:
+        sub = ev[ev[src].notna()]
+        m = verification.summarize_deterministic(sub, obs_col="obs_snowfall_in", pred_col=src)
+        m["by_lead"] = {int(lead): verification.mae_bias(g["obs_snowfall_in"], g[src])
+                        for lead, g in sub.groupby("lead_days")}
+        m["by_month"] = {}
+        for mon, g in sub.groupby(pd.to_datetime(sub["valid_date"]).dt.strftime("%Y-%m")):
+            mm = verification.mae_bias(g["obs_snowfall_in"], g[src])
+            mm.update({k: v for k, v in verification.csi_pod_far(
+                g["obs_snowfall_in"], g[src], threshold_in=1.0).items()
+                if k in ("csi", "pod", "freq_bias")})
+            m["by_month"][mon] = mm
+        metrics["sources"][src] = m
+        if m["n"] == 0:
+            print(f"{src:>12}: no rows (model not in backfill coverage yet)")
+            continue
+        print(f"{src:>12}: n={m['n']} mae={_fmt(m['mae'])} bias={_fmt(m['bias'], '+.3f')} "
+              f"event_mae={_fmt(m['event_mae'])} "
+              f"csi_1in={_fmt(m['csi_1in'])} pod_1in={_fmt(m['pod_1in'])} "
+              f"fb_1in={_fmt(m['fb_1in'], '0.2f')} "
+              f"csi_6in={_fmt(m['csi_6in'])} pod_6in={_fmt(m['pod_6in'])}")
+
+    # Probabilistic block: CRPS from the quantile members + CRPSS vs a
+    # per-(station, month) climatology built from the training period only.
+    qcols = sorted((c for c in preds.columns if c.startswith("q")), key=lambda c: int(c[1:]))
+    q_levels = [int(c[1:]) / 100 for c in qcols]
+    crps = verification.crps_from_quantiles(
+        ev["obs_snowfall_in"].to_numpy(), preds[qcols].to_numpy(), q_levels)
+    metrics["crps_postproc"] = crps
+    clim_q = verification.climatology_quantiles(train_df, ev, q_levels=q_levels)
+    crps_clim = verification.crps_from_quantiles(
+        ev["obs_snowfall_in"].to_numpy(), clim_q, q_levels)
+    metrics["crps_climatology"] = crps_clim
+    metrics["crpss_vs_climatology"] = verification.crpss(crps, crps_clim)
+    print(f"postproc CRPS={_fmt(crps)}  clim CRPS={_fmt(crps_clim)}  "
+          f"CRPSS={_fmt(metrics['crpss_vs_climatology'])}")
+
+    # Probability heads: Brier/BSS + reliability per threshold (W4 needs all
+    # of them, not just 1in). Falls back to the legacy psnow column on
+    # pre-v1.6 models where p2/p6/p12 don't exist.
+    prob_cols = [(thr, f"p{thr:g}") for thr in postproc.EVENT_THRESHOLDS
+                 if f"p{thr:g}" in preds.columns]
+    if not prob_cols and "psnow" in preds.columns:
+        prob_cols = [(postproc.EVENT_THRESHOLD_IN, "psnow")]
+    for thr, col in prob_cols:
+        bs = verification.brier_skill(ev["obs_snowfall_in"], preds[col],
+                                      threshold_in=thr)
+        rel = verification.reliability_curve(ev["obs_snowfall_in"], preds[col],
+                                             threshold_in=thr)
+        metrics[f"prob_{thr:g}in"] = {**bs, "reliability": rel}
+        print(f"P(>= {thr:g}in): Brier={_fmt(bs['brier'], '0.4f')} "
+              f"BSS={_fmt(bs['bss'])}  reliability(pred->obs): "
+              + " ".join(f"{r['pred']}->{r['obs']}(n{r['n']})" for r in rel))
+    if prob_cols and prob_cols[0][1] in ("psnow", "p1"):
+        metrics["psnow"] = metrics[f"prob_{prob_cols[0][0]:g}in"]  # legacy key
+
+    # Head-to-head vs NBM on shared rows, blocked by station-week: MAE delta
+    # (paired bootstrap) plus CSI deltas at 1/6 in via the generic block
+    # bootstrap — the event-detection claims need CIs too.
+    head = ev[ev["postproc"].notna() & ev["nbm_raw"].notna()].copy()
+    if not head.empty:
+        head["err_pp"] = head["postproc"] - head["obs_snowfall_in"]
+        head["err_nbm"] = head["nbm_raw"] - head["obs_snowfall_in"]
+        bb = verification.paired_block_bootstrap(
+            head, err_a="err_pp", err_b="err_nbm", n_boot=n_boot)
+        metrics["vs_nbm"] = bb
+        if bb["diff"] is not None:
+            print(f"postproc vs NBM: ΔMAE={bb['diff']:+.3f} in "
+                  f"[{bb['ci_lo']:+.3f}, {bb['ci_hi']:+.3f}] "
+                  f"P(better)={bb['p_a_better']:.2f} over {bb['n_blocks']} station-weeks")
+        for thr in (1.0, 6.0):
+            def csi_delta(d, thr=thr):
+                a = verification.csi_pod_far(d["obs_snowfall_in"], d["postproc"],
+                                             threshold_in=thr)["csi"]
+                b = verification.csi_pod_far(d["obs_snowfall_in"], d["nbm_raw"],
+                                             threshold_in=thr)["csi"]
+                return np.nan if a is None or b is None else a - b
+            bs = verification.block_bootstrap_stat(
+                head, csi_delta, n_boot=min(n_boot, 500))
+            metrics[f"vs_nbm_csi_{thr:g}in"] = bs
+            if bs["stat"] is not None and bs["ci_lo"] is not None:
+                print(f"postproc vs NBM ΔCSI@{thr:g}in: {bs['stat']:+.3f} "
+                      f"[{bs['ci_lo']:+.3f}, {bs['ci_hi']:+.3f}] "
+                      f"P(better)={bs['p_gt_0']:.2f}")
+
+    return metrics, boosters, calib
 
 
 def main() -> int:
@@ -40,6 +248,8 @@ def main() -> int:
     ap.add_argument("--pairs", type=Path, default=ROOT / "data" / "training" / "pairs.csv.gz")
     ap.add_argument("--cutoff", default=None,
                     help="test-period start date (default: last 20%% of dates)")
+    ap.add_argument("--folds", action="store_true",
+                    help="evaluate the named temporal folds (no models saved)")
     ap.add_argument("--out", type=Path, default=postproc.MODELS_DIR)
     ap.add_argument("--no-save", action="store_true")
     args = ap.parse_args()
@@ -49,89 +259,46 @@ def main() -> int:
     if pairs.empty:
         print("no usable pairs — build training data first")
         return 1
+    print(f"{len(pairs)} usable pairs, {pairs['triplet'].nunique()} stations")
+
+    if args.folds:
+        results = {}
+        for name, f in FOLDS.items():
+            train_df = pairs[pairs["valid_date"] < f["train_end"]]
+            test_df = pairs[pairs["valid_date"] >= f["test_start"]]
+            if f["test_end"]:
+                test_df = test_df[test_df["valid_date"] <= f["test_end"]]
+            if train_df.empty or test_df.empty:
+                print(f"fold {name}: degenerate split, skipped")
+                continue
+            cal_w = (f["cal_start"], f["cal_end"]) \
+                if f.get("cal_start") and f.get("cal_end") else None
+            m, _, _ = evaluate_split(train_df, test_df, label=name, cal_window=cal_w)
+            m["fold"] = f
+            results[name] = m
+        out_path = args.out / "metrics_folds.json"
+        args.out.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps({"folds": results}, indent=2, default=float))
+        print(f"\nwrote fold metrics -> {out_path}")
+        return 0
 
     dates = np.sort(pairs["valid_date"].unique())
     cutoff = args.cutoff or str(dates[int(len(dates) * 0.8)])
     train_df = pairs[pairs["valid_date"] < cutoff]
     test_df = pairs[pairs["valid_date"] >= cutoff]
-    print(f"{len(pairs)} usable pairs, {pairs['triplet'].nunique()} stations | "
-          f"train {len(train_df)} (< {cutoff}) / test {len(test_df)}")
     if train_df.empty or test_df.empty:
         print("degenerate split — adjust --cutoff")
         return 1
-
-    boosters = postproc.train(train_df)
-    preds = postproc.predict(boosters, test_df)
-
-    ev = test_df.copy()
-    ev["postproc"] = preds["point"]               # Tweedie (production)
-    if "point_l1" in preds.columns:
-        ev["postproc_l1"] = preds["point_l1"]     # diagnostic MAE-optimal head
-    ev["nbm_raw"] = pd.to_numeric(ev.get("nbm_snowfall_cm"), errors="coerce") * CM_TO_IN
-    ev["mm_mean"] = pd.to_numeric(ev.get("mm_snow_mean_cm"), errors="coerce") * CM_TO_IN
-
-    metrics: dict = {"cutoff": cutoff, "n_train": len(train_df), "n_test": len(test_df),
-                     "n_stations": int(pairs["triplet"].nunique()), "sources": {}}
-    sources = ["postproc"] + (["postproc_l1"] if "postproc_l1" in ev.columns else []) \
-        + ["nbm_raw", "mm_mean"]
-    for src in sources:
-        sub = ev[ev[src].notna()]
-        m = verification.summarize_deterministic(sub, obs_col="obs_snowfall_in", pred_col=src)
-        by_lead = {}
-        for lead, g in sub.groupby("lead_days"):
-            by_lead[int(lead)] = verification.mae_bias(g["obs_snowfall_in"], g[src])
-        m["by_lead"] = by_lead
-        metrics["sources"][src] = m
-        if m["n"] == 0:
-            print(f"{src:>9}: no rows (model not in backfill coverage yet)")
-            continue
-        fmt = lambda v, spec="0.3f": format(v, spec) if v is not None else "n/a"  # noqa: E731
-        print(f"{src:>12}: n={m['n']} mae={fmt(m['mae'])} bias={fmt(m['bias'], '+.3f')} "
-              f"event_mae={fmt(m['event_mae'])} "
-              f"csi_1in={fmt(m['csi_1in'])} csi_2in={fmt(m['csi_2in'])} pod_1in={fmt(m['pod_1in'])}")
-
-    qcols = sorted((c for c in preds.columns if c.startswith("q")), key=lambda c: int(c[1:]))
-    crps = verification.crps_from_quantiles(
-        ev["obs_snowfall_in"].to_numpy(), preds[qcols].to_numpy(),
-        [int(c[1:]) / 100 for c in qcols])
-    metrics["crps_postproc"] = crps
-    print(f"postproc CRPS (from {qcols}): {crps:.3f}" if crps is not None else "CRPS: n/a")
-
-    # Occurrence head calibration: Brier score + a 5-bin reliability table for
-    # P(snow >= EVENT_THRESHOLD_IN). A well-calibrated psnow is what makes the
-    # hurdle gate trustworthy and is a UI-facing probability in its own right.
-    if "psnow" in preds.columns:
-        p = preds["psnow"].to_numpy()
-        occ = (ev["obs_snowfall_in"].to_numpy() >= postproc.EVENT_THRESHOLD_IN).astype(float)
-        brier = float(np.mean((p - occ) ** 2))
-        edges = np.linspace(0, 1, 6)
-        rel = []
-        for lo, hi in zip(edges[:-1], edges[1:]):
-            m = (p >= lo) & (p < hi if hi < 1 else p <= hi)
-            if m.any():
-                rel.append({"bin": f"{lo:.1f}-{hi:.1f}", "n": int(m.sum()),
-                            "pred": round(float(p[m].mean()), 3),
-                            "obs": round(float(occ[m].mean()), 3)})
-        metrics["psnow"] = {"brier": brier, "reliability": rel}
-        print(f"psnow Brier={brier:.4f}  reliability(pred->obs): "
-              + " ".join(f"{r['pred']}->{r['obs']}(n{r['n']})" for r in rel))
-
-    # Head-to-head on rows where both exist, blocked by station-week.
-    head = ev[ev["postproc"].notna() & ev["nbm_raw"].notna()].copy()
-    if not head.empty:
-        head["err_pp"] = head["postproc"] - head["obs_snowfall_in"]
-        head["err_nbm"] = head["nbm_raw"] - head["obs_snowfall_in"]
-        bb = verification.paired_block_bootstrap(head, err_a="err_pp", err_b="err_nbm")
-        metrics["vs_nbm"] = bb
-        if bb["diff"] is not None:
-            print(f"postproc vs NBM: ΔMAE={bb['diff']:+.3f} in "
-                  f"[{bb['ci_lo']:+.3f}, {bb['ci_hi']:+.3f}] "
-                  f"P(better)={bb['p_a_better']:.2f} over {bb['n_blocks']} station-weeks")
+    metrics, boosters, calib = evaluate_split(train_df, test_df, label=f"cutoff_{cutoff}")
+    metrics["cutoff"] = cutoff
 
     if not args.no_save:
         meta = {"features": postproc.FEATURES, "quantiles": list(postproc.QUANTILES),
+                "event_thresholds": list(postproc.EVENT_THRESHOLDS),
                 "trained_through": cutoff, "metrics": metrics}
         postproc.save(boosters, models_dir=args.out, meta=meta)
+        if calib is not None:
+            postproc.save_calib(calib, models_dir=args.out)
         (args.out / "metrics.json").write_text(json.dumps(metrics, indent=2, default=float))
         print(f"saved models + metrics -> {args.out}")
     return 0

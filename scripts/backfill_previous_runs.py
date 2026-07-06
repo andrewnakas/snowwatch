@@ -286,23 +286,34 @@ def main() -> int:
     if args.max_seconds > 0:
         budget["deadline"] = t0 + args.max_seconds
     total_fetched = 0
-    for i, st in enumerate(stations, 1):
-        for mk in model_keys:
+    # Model-major iteration: complete the highest-priority model across ALL
+    # stations before spending budget on the next one. --models order is the
+    # priority order. Station-major (the old loop) spreads a night's budget
+    # across every model at a handful of stations; model-major gets NBM — the
+    # primary feature source AND the baseline-to-beat — to full-catalogue
+    # coverage in ~4-6 nights instead of months.
+    stopped = False
+    for mk in model_keys:
+        for i, st in enumerate(stations, 1):
             f, s = backfill_station_model(
                 st["triplet"], st["lat"], st["lon"], mk, args.start, args.end, budget)
             total_fetched += f
-        if budget.get("deadline") and time.time() > budget["deadline"]:
-            print(f"deadline reached after {i}/{len(stations)} stations "
-                  f"(budget {budget['spent']:.0f}/{budget['total']:.0f})")
+            if budget.get("deadline") and time.time() > budget["deadline"]:
+                print(f"deadline reached at {mk} {i}/{len(stations)} "
+                      f"(budget {budget['spent']:.0f}/{budget['total']:.0f})")
+                stopped = True
+                break
+            if budget["spent"] >= budget["total"]:
+                print(f"budget exhausted at {mk} {i}/{len(stations)} "
+                      f"({budget['spent']:.0f}/{budget['total']:.0f})")
+                stopped = True
+                break
+            if i % 25 == 0:
+                print(f"[{mk} {i}/{len(stations)}] chunks fetched={total_fetched} "
+                      f"budget={budget['spent']:.0f}/{budget['total']:.0f} "
+                      f"elapsed={time.time()-t0:.0f}s", flush=True)
+        if stopped:
             break
-        if budget["spent"] >= budget["total"]:
-            print(f"budget exhausted after {i}/{len(stations)} stations "
-                  f"({budget['spent']:.0f}/{budget['total']:.0f})")
-            break
-        if i % 25 == 0:
-            print(f"[{i}/{len(stations)}] chunks fetched={total_fetched} "
-                  f"budget={budget['spent']:.0f}/{budget['total']:.0f} "
-                  f"elapsed={time.time()-t0:.0f}s", flush=True)
 
     print(f"done: {total_fetched} chunks fetched, budget {budget['spent']:.0f}/{budget['total']:.0f}, "
           f"{time.time()-t0:.0f}s")

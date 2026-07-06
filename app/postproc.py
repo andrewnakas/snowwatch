@@ -28,11 +28,12 @@ try:
 except ImportError:  # pragma: no cover - exercised only without the wheel
     lgb = None
 
+from .calibration import apply_isotonic, lead_bucket
 from .targets import QC_UNRELIABLE
 
 MODELS_DIR = Path(__file__).resolve().parents[1] / "data" / "models"
 
-QUANTILES = (0.1, 0.5, 0.9)
+QUANTILES = (0.05, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 0.95)
 
 NUMERIC_FEATURES = [
     "nbm_snowfall_cm", "nbm_precip_mm", "nbm_tmean_c",
@@ -161,6 +162,17 @@ TWEEDIE_VARIANCE_POWER = 1.3   # 1->Poisson, 2->Gamma; ~1.3 fits precip-like tai
 EVENT_THRESHOLD_IN = 1.0       # what counts as a "snow event" for the classifier
 HURDLE_GATE = 0.3              # psnow above this floors the call at EVENT_THRESHOLD_IN
 
+# v1.6 multi-threshold decision layer: one exceedance head per operational
+# threshold, calibrated (isotonic) and gated per lead bucket. The single-gate
+# hurdle above is the legacy fallback for models saved before v1.6.
+EVENT_THRESHOLDS = (1.0, 2.0, 6.0, 12.0)
+SPW_CAP = 300.0                # scale_pos_weight ceiling: 12in positives are
+                               # ~0.1% of rows; uncapped neg/pos destabilizes
+
+
+def _exc_key(thr: float) -> str:
+    return f"exc_{thr:g}".replace(".", "p")
+
 
 def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROUNDS) -> dict:
     """Train quantile boosters + a Tweedie point booster (+ an L1 head for
@@ -188,14 +200,23 @@ def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROU
     tw_params.pop("alpha", None)
     out["amount"] = lgb.train(tw_params, dset, num_boost_round=num_rounds)
 
-    # Occurrence head: P(snowfall >= EVENT_THRESHOLD_IN). Drives the hurdle
-    # gate and is itself a calibrated event-probability output for the UI.
-    clf_label = (y.to_numpy() >= EVENT_THRESHOLD_IN).astype(int)
-    cdset = lgb.Dataset(X, label=clf_label, categorical_feature=CATEGORICAL_FEATURES,
-                        free_raw_data=False)
-    clf_params = dict(LGB_PARAMS, objective="binary", metric="binary_logloss")
-    clf_params.pop("alpha", None)
-    out["psnow"] = lgb.train(clf_params, cdset, num_boost_round=num_rounds)
+    # Exceedance heads: P(snowfall >= T) per operational threshold. Each is
+    # isotonic-calibrated downstream (app/calibration.py), so what matters
+    # here is ranking quality on the rare positives — hence scale_pos_weight.
+    # The 1in head doubles as the legacy `psnow` occurrence probability.
+    for thr in EVENT_THRESHOLDS:
+        clf_label = (y.to_numpy() >= thr).astype(int)
+        pos = clf_label.sum()
+        if pos == 0 or pos == clf_label.size:
+            continue                      # nothing to learn at this threshold
+        spw = min((clf_label.size - pos) / pos, SPW_CAP)
+        cdset = lgb.Dataset(X, label=clf_label,
+                            categorical_feature=CATEGORICAL_FEATURES,
+                            free_raw_data=False)
+        clf_params = dict(LGB_PARAMS, objective="binary",
+                          metric="binary_logloss", scale_pos_weight=spw)
+        clf_params.pop("alpha", None)
+        out[_exc_key(thr)] = lgb.train(clf_params, cdset, num_boost_round=num_rounds)
 
     # Diagnostic L1 head — kept so the scorecard can show the MAE-optimal
     # model's CSI collapse next to the hurdle model. Not used in production.
@@ -205,17 +226,20 @@ def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROU
     return out
 
 
-def predict(boosters: dict, pairs: pd.DataFrame, *, gate: float = HURDLE_GATE) -> pd.DataFrame:
+def predict(boosters: dict, pairs: pd.DataFrame, *, calib: Optional[dict] = None,
+            gate: float = HURDLE_GATE) -> pd.DataFrame:
     """Predictions per row. Columns:
-      amount  — raw Tweedie regressor output (>=0)
-      psnow   — P(snow event), if the occurrence head is present
-      point   — production prediction: the hurdle combination of the two
-      q10/q50/q90 — quantile members (clamped >=0, re-sorted; GBMs can cross)
+      amount   — raw Tweedie regressor output (>=0)
+      p1/p2/p6/p12 — calibrated exceedance probabilities (monotone in T)
+      psnow    — alias of p1 (legacy UI name)
+      point    — production prediction: cascade of amount + gated floors
+      q5..q95  — quantile members (clamped >=0, re-sorted; GBMs can cross)
 
-    The hurdle: where an event is likely (psnow >= gate) but the regressor
-    under-calls it (amount < EVENT_THRESHOLD_IN), floor the call at the
-    threshold. Recovers POD/CSI the regressor alone gives up. With no psnow
-    head (older saved models) `point` falls back to `amount`.
+    The cascade generalizes the single hurdle: point = max(amount, largest T
+    whose calibrated exceedance probability clears its per-lead-bucket gate).
+    `calib` is the postproc_calib.json payload ({"iso": ..., "gates": ...});
+    without it (or with pre-v1.6 saved models) the legacy 1in hurdle applies,
+    so old model dirs keep producing exactly what they used to.
     """
     X = build_features(pairs)
     raw = {name: bst.predict(X) for name, bst in boosters.items()}
@@ -223,7 +247,43 @@ def predict(boosters: dict, pairs: pd.DataFrame, *, gate: float = HURDLE_GATE) -
 
     amount = np.maximum(0.0, raw.get("amount", raw.get("point", np.zeros(len(pairs)))))
     out["amount"] = amount
-    if "psnow" in raw:
+
+    present = [t for t in EVENT_THRESHOLDS if _exc_key(t) in raw]
+    if present:
+        # Monotone raw scores (P(>=T) can't rise with T), calibrate each,
+        # then re-enforce monotonicity — separate isotonic curves can cross.
+        iso = (calib or {}).get("iso", {})
+        cal: dict[float, np.ndarray] = {}
+        running = None
+        for thr in present:
+            p = raw[_exc_key(thr)]
+            running = p if running is None else np.minimum(running, p)
+            cal[thr] = apply_isotonic(running, iso.get(f"{thr:g}"))
+        running = None
+        for thr in present:
+            running = cal[thr] if running is None else np.minimum(running, cal[thr])
+            cal[thr] = running
+            out[f"p{thr:g}"] = cal[thr]
+        out["psnow"] = cal[present[0]]
+
+        gates = (calib or {}).get("gates", {})
+        floor = np.zeros(len(pairs))
+        if gates:
+            buckets = np.array([lead_bucket(int(ld))
+                                for ld in pd.to_numeric(pairs["lead_days"])])
+            for thr in present:
+                for b, info in gates.get(f"{thr:g}", {}).items():
+                    g = (info or {}).get("gate")
+                    if g is None:
+                        continue
+                    hit = (buckets == b) & (cal[thr] >= g)
+                    floor = np.where(hit, np.maximum(floor, thr), floor)
+        else:
+            # No tuned gates yet (evaluation during calibration fitting, or a
+            # calib-less deploy): fall back to the legacy 1in hurdle.
+            floor = np.where(cal[present[0]] >= gate, EVENT_THRESHOLD_IN, 0.0)
+        out["point"] = np.maximum(amount, floor)
+    elif "psnow" in raw:
         psnow = raw["psnow"]
         out["psnow"] = psnow
         point = np.where((psnow >= gate) & (amount < EVENT_THRESHOLD_IN),
@@ -232,10 +292,10 @@ def predict(boosters: dict, pairs: pd.DataFrame, *, gate: float = HURDLE_GATE) -
     else:
         out["point"] = amount
 
-    for name in ("q10", "q50", "q90"):
-        if name in raw:
+    for name in raw:
+        if name.startswith("q") and name[1:].isdigit():
             out[name] = np.maximum(0.0, raw[name])
-    qcols = sorted((c for c in out.columns if c.startswith("q")),
+    qcols = sorted((c for c in out.columns if c.startswith("q") and c[1:].isdigit()),
                    key=lambda c: int(c[1:]))
     if len(qcols) > 1:
         out[qcols] = np.sort(out[qcols].to_numpy(), axis=1)
@@ -261,3 +321,19 @@ def load(*, models_dir: Path = MODELS_DIR) -> Optional[dict]:
     if not paths:
         return None
     return {p.stem.replace("postproc_", ""): lgb.Booster(model_file=str(p)) for p in paths}
+
+
+def save_calib(calib: dict, *, models_dir: Path = MODELS_DIR) -> None:
+    models_dir.mkdir(parents=True, exist_ok=True)
+    (models_dir / "postproc_calib.json").write_text(json.dumps(calib, indent=2))
+
+
+def load_calib(*, models_dir: Path = MODELS_DIR) -> Optional[dict]:
+    """Isotonic curves + tuned gates (postproc_calib.json); None pre-v1.6."""
+    p = models_dir / "postproc_calib.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None

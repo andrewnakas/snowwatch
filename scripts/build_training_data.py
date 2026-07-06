@@ -44,7 +44,13 @@ MODEL_KEYS = ("nbm", "hrrr", "gfs", "ifs", "aifs")
 SNOW_MODELS = ("nbm", "hrrr", "gfs")  # models with archived snowfall
 
 
-def build_station(st: dict, *, hist_days: int = 900) -> pd.DataFrame | None:
+# SNOTEL obs history window. The Zarr GFS/HRRR/GEFS backfill reaches winter
+# 2021-22, so the obs pull must too — AWDB is free, the constraint is only
+# fetch time. 1900 days ≈ 5.2 winters.
+HIST_DAYS = 1900
+
+
+def build_station(st: dict, *, hist_days: int = HIST_DAYS) -> pd.DataFrame | None:
     triplet = st["triplet"]
 
     # Forecasts: wide-merge the per-model prevruns series on (valid_date, lead).
@@ -151,6 +157,30 @@ def main() -> int:
     n_evt = int((pairs["obs_snowfall_in"] > 0.5).sum())
     print(f"wrote {len(pairs)} pairs ({len(frames)} stations, {n_evt} snowfall-event rows) "
           f"-> {args.out} ({args.out.stat().st_size/1e6:.1f} MB)")
+
+    # Coverage report: stations × winters × model — the honest picture of
+    # what the pooled model actually trains on (and the Phase-2 progress bar).
+    cov = pairs.copy()
+    vd = pd.to_datetime(cov["valid_date"])
+    cov["winter"] = np.where(vd.dt.month >= 10, vd.dt.year, vd.dt.year - 1).astype(str)
+    report: dict = {"built": date.today().isoformat(), "n_pairs": int(len(pairs)),
+                    "n_stations": int(cov["triplet"].nunique()),
+                    "event_rows_6in": int((pairs["obs_snowfall_in"] >= 6.0).sum()),
+                    "event_rows_12in": int((pairs["obs_snowfall_in"] >= 12.0).sum()),
+                    "by_winter": {}, "stations_by_model": {}}
+    for w, g in cov.groupby("winter"):
+        report["by_winter"][w] = {"rows": int(len(g)),
+                                  "stations": int(g["triplet"].nunique())}
+    for mk in MODEL_KEYS:
+        col = f"{mk}_precip_mm"
+        if col in cov.columns:
+            report["stations_by_model"][mk] = int(
+                cov.loc[cov[col].notna(), "triplet"].nunique())
+    cov_path = args.out.parent / "coverage.json"
+    cov_path.write_text(json.dumps(report, indent=2))
+    print(f"coverage: {json.dumps(report['stations_by_model'])} | "
+          f"6in rows={report['event_rows_6in']} 12in rows={report['event_rows_12in']} "
+          f"-> {cov_path}")
     return 0
 
 
