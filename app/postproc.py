@@ -178,6 +178,11 @@ def build_inference_features(
         pcols = [c for c in FEATURE_GROUPS["phase"] if c in p.columns]
         df = df.drop(columns=pcols).merge(
             p[["valid_date"] + pcols], on="valid_date", how="left")
+        # Gate mirror of build_training_data.py: phase features exist only
+        # on rows whose consensus precip clears the shared storm gate.
+        from .phase_features import storm_gate
+        gated_off = ~storm_gate(df.get("mm_precip_mean_mm")).to_numpy()
+        df.loc[gated_off, pcols] = np.nan
     return df
 
 

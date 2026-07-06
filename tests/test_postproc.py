@@ -76,6 +76,29 @@ class TestBuildInferenceFeatures:
         assert feats.empty
 
 
+class TestPhaseGateMirror:
+    def test_phase_cols_masked_below_gate(self):
+        import pandas as pd
+        from datetime import date, timedelta
+        issue = date(2026, 1, 10)
+        mm = _mm_fcst(3, issue + timedelta(days=1))
+        # Day 2 gets zero precip everywhere -> below the storm gate.
+        for mk in ("nbm", "hrrr", "gfs", "ifs", "aifs"):
+            mm.loc[1, f"{mk}_precip"] = 0.0
+        phase = pd.DataFrame({
+            "valid_date": [(issue + timedelta(days=i)).isoformat() for i in (1, 2, 3)],
+            "wb_mean_c": [-3.0, -4.0, -5.0],
+            "wb_min_c": [-6.0, -7.0, -8.0],
+            "hours_wb_below_0": [24.0, 24.0, 24.0],
+        })
+        feats = postproc.build_inference_features(
+            mm, statics=STATICS, last_depth=30.0, last_swe=8.0,
+            issue_date=issue, horizon=3, phase_daily=phase)
+        assert feats.loc[feats["lead_days"] == 1, "wb_mean_c"].notna().all()
+        assert feats.loc[feats["lead_days"] == 2, "wb_mean_c"].isna().all()
+        assert feats.loc[feats["lead_days"] == 3, "wb_mean_c"].notna().all()
+
+
 class TestNbmVersion:
     def test_epochs(self):
         assert postproc.nbm_version_for("2025-05-01") == "v4.2"

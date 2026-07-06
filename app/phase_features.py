@@ -64,6 +64,30 @@ def daily_phase_aggregates(
     return out
 
 
+def live_phase_daily(phase_hourly: pd.DataFrame) -> pd.DataFrame:
+    """Daily GFS wet-bulb aggregates from met.fetch_phase_hourly output.
+
+    Open-Meteo multi-model responses suffix variables per model; training
+    phase features come from the GFS archive, so ONLY the gfs025 columns
+    feed the model (NBM columns are fetched for the UI/future use). Output:
+    valid_date + wb_mean_c/wb_min_c/hours_wb_below_0 — merge-ready for
+    postproc.build_inference_features(phase_daily=...).
+    """
+    if phase_hourly is None or phase_hourly.empty:
+        return pd.DataFrame(columns=["valid_date", "wb_mean_c", "wb_min_c",
+                                     "hours_wb_below_0"])
+    t_col = next((c for c in ("temperature_2m_gfs025", "temperature_2m")
+                  if c in phase_hourly.columns), None)
+    rh_col = next((c for c in ("relative_humidity_2m_gfs025", "relative_humidity_2m")
+                   if c in phase_hourly.columns), None)
+    if t_col is None or rh_col is None:
+        return pd.DataFrame(columns=["valid_date", "wb_mean_c", "wb_min_c",
+                                     "hours_wb_below_0"])
+    out = phase_frame_from_hourly(phase_hourly, time_col="datetime",
+                                  t_col=t_col, rh_col=rh_col, fl_col=None)
+    return out[["valid_date", "wb_mean_c", "wb_min_c", "hours_wb_below_0"]]
+
+
 def phase_frame_from_hourly(
     df: pd.DataFrame, *, time_col: str = "time", t_col: str = "t_c",
     rh_col: str = "rh_pct", fl_col: Optional[str] = "freezing_level_m",

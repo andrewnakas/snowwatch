@@ -250,9 +250,24 @@ def _member_postproc_snowfall(
     if not boosters or ("point" not in boosters and "amount" not in boosters):
         return [], []
     statics = _targets.station_statics(station, hist_qc)
+
+    # Phase features (v1.6 Tier 1), storm-gated: fetch the hourly t/rh only
+    # when some forecast day clears the shared gate — per-day masking to the
+    # same gate happens inside build_inference_features, mirroring training.
+    phase_daily = None
+    if boosters and any(c in _postproc.FEATURE_GROUPS["phase"]
+                        for c in next(iter(boosters.values())).feature_name()):
+        from . import met as _met
+        from .phase_features import live_phase_daily, storm_gate
+        precip_cols = [c for c in mm_fcst.columns if c.endswith("_precip")]
+        if precip_cols and storm_gate(mm_fcst[precip_cols].mean(axis=1)).any():
+            phase_daily = live_phase_daily(
+                _met.fetch_phase_hourly(station["lat"], station["lon"], days=horizon))
+
     feats = _postproc.build_inference_features(
         mm_fcst, statics=statics, last_depth=last_depth, last_swe=last_swe,
-        issue_date=today, horizon=horizon, ens_fcst=ens_fcst)
+        issue_date=today, horizon=horizon, ens_fcst=ens_fcst,
+        phase_daily=phase_daily)
     if feats.empty:
         return [], []
     preds = _postproc.predict(boosters, feats, calib=_postproc.load_calib())
