@@ -55,17 +55,16 @@ CAL_TAIL_DAYS = 60
 # original 2026-02-28 cutoff (test = melt season, kept as the cautionary
 # comparison, not as evidence).
 FOLDS = {
-    # cal_start/cal_end: season-matched calibration windows — the test window
-    # shifted back one year. A last-60-days tail (Oct–Nov for fold A) holds
-    # almost no 6in+ events, so isotonic curves and gates at rare thresholds
-    # were fit on nothing (verified 2026-07-06: 6in reliability 0.23->0.45,
-    # i.e. badly underconfident). The boosters never see the cal window.
+    # Calibration slice: default last-CAL_TAIL_DAYS tail. A season-matched
+    # prior-winter window (cal_start/cal_end per fold) was tried 2026-07-06
+    # and made everything worse — with ~1.3 winters of pairs it removes the
+    # only other core winter from training (MAE 0.714→0.809, CSI@6
+    # 0.197→0.139). Revisit season-matched windows once the Zarr backfill
+    # delivers 5 winters; the mechanism (evaluate_split cal_window) stays.
     "A_core_winter": {"train_end": "2025-11-30",
-                      "test_start": "2025-12-01", "test_end": "2026-02-28",
-                      "cal_start": "2024-12-01", "cal_end": "2025-02-28"},
+                      "test_start": "2025-12-01", "test_end": "2026-02-28"},
     "B_spring": {"train_end": "2026-02-28",
-                 "test_start": "2026-02-28", "test_end": None,
-                 "cal_start": "2025-02-28", "cal_end": "2025-06-14"},
+                 "test_start": "2026-02-28", "test_end": None},
 }
 
 
@@ -210,6 +209,48 @@ def evaluate_split(train_df: pd.DataFrame, test_df: pd.DataFrame, *,
               + " ".join(f"{r['pred']}->{r['obs']}(n{r['n']})" for r in rel))
     if prob_cols and prob_cols[0][1] in ("psnow", "p1"):
         metrics["psnow"] = metrics[f"prob_{prob_cols[0][0]:g}in"]  # legacy key
+
+    # nbm_tuned — the fair-fight baseline: NBM's own amounts with per-
+    # threshold, per-lead-bucket decision thresholds CSI-optimized on the
+    # SAME calibration window the postproc gates got. Beating raw NBM's
+    # fixed thresholds alone would be a straw man. Event stats only: its
+    # amounts (and hence MAE) are nbm_raw's.
+    if not cal_df.empty and "nbm_snowfall_cm" in cal_df.columns:
+        nbm_cal = pd.to_numeric(cal_df["nbm_snowfall_cm"], errors="coerce") * CM_TO_IN
+        cal_ok = nbm_cal.notna()
+        nbm_test = pd.to_numeric(ev.get("nbm_snowfall_cm"), errors="coerce") * CM_TO_IN
+        test_ok = nbm_test.notna()
+        if cal_ok.sum() > 500 and test_ok.sum() > 0:
+            tuned: dict = {}
+            test_leads = pd.to_numeric(ev.loc[test_ok, "lead_days"]).astype(int)
+            buckets_test = np.array([calibration.lead_bucket(ld) for ld in test_leads])
+            for thr in postproc.EVENT_THRESHOLDS:
+                grid = np.round(np.arange(0.2, 2.01, 0.1) * thr, 2)
+                g_by_bucket = calibration.tune_gate(
+                    nbm_cal[cal_ok].to_numpy(),
+                    pd.to_numeric(cal_df.loc[cal_ok, "obs_snowfall_in"]).to_numpy(),
+                    pd.to_numeric(cal_df.loc[cal_ok, "lead_days"]).astype(int).to_numpy(),
+                    threshold_in=thr, candidates=grid)
+                pred = np.zeros(int(test_ok.sum()))
+                for b, info in g_by_bucket.items():
+                    g = (info or {}).get("gate")
+                    if g is None:
+                        continue
+                    hit = (buckets_test == b) & (nbm_test[test_ok].to_numpy() >= g)
+                    pred[hit] = thr
+                c = verification.csi_pod_far(
+                    ev.loc[test_ok, "obs_snowfall_in"], pred, threshold_in=thr)
+                tuned[f"csi_{thr:g}in"] = c["csi"]
+                tuned[f"pod_{thr:g}in"] = c["pod"]
+                tuned[f"far_{thr:g}in"] = c["far"]
+                tuned[f"fb_{thr:g}in"] = c["freq_bias"]
+            tuned["n"] = int(test_ok.sum())
+            tuned["note"] = "event stats only; amounts (MAE) are nbm_raw's"
+            metrics["sources"]["nbm_tuned"] = tuned
+            print(f"   nbm_tuned: csi_1in={_fmt(tuned.get('csi_1in'))} "
+                  f"csi_6in={_fmt(tuned.get('csi_6in'))} "
+                  f"csi_12in={_fmt(tuned.get('csi_12in'))} "
+                  f"fb_6in={_fmt(tuned.get('fb_6in'), '0.2f')}")
 
     # Head-to-head vs NBM on shared rows, blocked by station-week: MAE delta
     # (paired bootstrap) plus CSI deltas at 1/6 in via the generic block

@@ -27,6 +27,12 @@ ARCHIVE_SCHEMA = 1
 #   blend, member:<name>          — depth_in forecasts (snow depth, inches)
 #   model:<nbm|hrrr|gfs|ifs|aifs> — raw model daily snowfall/precip/temp
 #   ens                           — ensemble spread stats (snowfall_cm=p50)
+#   postproc                      — post-processor daily snowfall: point in
+#                                   snowfall_cm (converted from inches),
+#                                   q10/q90 reuse ens_snow_p10/p90 (cm),
+#                                   P(>=1in) reuses ens_prob_pos. Reusing the
+#                                   generic columns keeps the byte-append
+#                                   stream schema-stable (no migration).
 ARCHIVE_COLUMNS = [
     "schema",        # int, ARCHIVE_SCHEMA
     "triplet",       # str  station triplet
@@ -127,6 +133,23 @@ def rows_from_forecast(fc_data: dict, *, build_hour: int) -> list[dict]:
                 "lead_days": lead, "valid_date": r["date"], "source": f"model:{model}",
                 "snowfall_cm": snow, "precip_mm": precip, "tmean_c": tmean,
             })
+
+    # Post-processor daily snowfall (as-issued; verified by the live
+    # scorecard). Values arrive in inches, archived in cm like model rows.
+    in_to_cm = 2.54
+    for r in fc_data.get("postproc_daily") or []:
+        lead = _lead(r.get("date", ""))
+        if not lead or lead < 1:
+            continue
+        snow_in = r.get("snowfall_in")
+        rows.append({
+            "triplet": triplet, "issue_date": issue, "build_hour": build_hour,
+            "lead_days": lead, "valid_date": r["date"], "source": "postproc",
+            "snowfall_cm": None if snow_in is None else snow_in * in_to_cm,
+            "ens_snow_p10": None if r.get("q10") is None else r["q10"] * in_to_cm,
+            "ens_snow_p90": None if r.get("q90") is None else r["q90"] * in_to_cm,
+            "ens_prob_pos": r.get("p1"),
+        })
 
     # Ensemble spread stats.
     for r in fc_data.get("ensemble_stats") or []:

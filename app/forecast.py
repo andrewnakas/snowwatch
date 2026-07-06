@@ -232,28 +232,36 @@ def _member_nbm_snow17(
 def _member_postproc_snowfall(
     last_depth: float, last_swe: Optional[float], mm_fcst: pd.DataFrame,
     station: dict, hist_qc: pd.DataFrame, *, today: date, horizon: int,
-) -> List[float]:
+) -> tuple[List[float], List[dict]]:
     """Pooled LightGBM post-processed snowfall accumulated onto the pack with
-    the same degree-day melt as nbm_snowfall (v1.5).
+    the same degree-day melt as nbm_snowfall (v1.5); v1.6 adds the calibrated
+    multi-threshold cascade + a daily snowfall detail list for the archive.
 
     Off unless SW_ENABLE_POSTPROC=1 AND trained models sit in data/models —
     this member must never ship on smoke-trained weights by accident.
     """
     if os.environ.get("SW_ENABLE_POSTPROC") != "1":
-        return []
+        return [], []
     if mm_fcst is None or mm_fcst.empty:
-        return []
+        return [], []
     from . import postproc as _postproc
     boosters = _postproc.load()
-    if not boosters or "point" not in boosters:
-        return []
+    if not boosters or ("point" not in boosters and "amount" not in boosters):
+        return [], []
     statics = _targets.station_statics(station, hist_qc)
     feats = _postproc.build_inference_features(
         mm_fcst, statics=statics, last_depth=last_depth, last_swe=last_swe,
         issue_date=today, horizon=horizon)
     if feats.empty:
-        return []
-    preds = _postproc.predict(boosters, feats)
+        return [], []
+    preds = _postproc.predict(boosters, feats, calib=_postproc.load_calib())
+    daily: List[dict] = []
+    for i, (_, frow) in enumerate(feats.iterrows()):
+        d = {"date": frow["valid_date"], "snowfall_in": round(float(preds["point"].iloc[i]), 3)}
+        for c in ("p1", "p2", "p6", "p12", "q10", "q50", "q90"):
+            if c in preds.columns and np.isfinite(preds[c].iloc[i]):
+                d[c] = round(float(preds[c].iloc[i]), 3)
+        daily.append(d)
     snow_by_lead = dict(zip(feats["lead_days"], preds["point"]))
     tmean_by_lead = dict(zip(feats["lead_days"],
                              pd.to_numeric(feats.get("nbm_tmean_c"), errors="coerce")))
@@ -266,7 +274,7 @@ def _member_postproc_snowfall(
                    if t is not None and np.isfinite(t) and float(t) > FREEZE_THRESHOLD_C else 0.0)
         depth = max(0.0, depth + snow_in - melt_in)
         out.append(depth)
-    return out
+    return out, daily
 
 
 def _member_nbm_snowfall(last_depth: float, nbm_df: pd.DataFrame, horizon: int) -> List[float]:
@@ -477,6 +485,10 @@ class StationForecast:
     # archived by scripts/archive_forecasts.py for training & verification.
     multimodel: List[dict] = field(default_factory=list)
     ensemble_stats: List[dict] = field(default_factory=list)
+    # Post-processor daily snowfall detail (point/quantiles/exceedance
+    # probs), archived as source="postproc" — the as-issued rows the live
+    # scorecard verifies. Depth members alone can't verify daily snowfall.
+    postproc_daily: List[dict] = field(default_factory=list)
 
 
 _DECAY_BY_MEMBER = {
@@ -1010,7 +1022,7 @@ def forecast_station(
     if nbm_pred:
         members_raw["nbm_snowfall"] = nbm_pred
 
-    pp_pred = _member_postproc_snowfall(
+    pp_pred, pp_daily = _member_postproc_snowfall(
         last_depth, last_swe, mm_fcst, station, hist_qc, today=today, horizon=horizon)
     if pp_pred:
         members_raw["postproc_snowfall"] = pp_pred
@@ -1165,4 +1177,5 @@ def forecast_station(
         notes=notes,
         multimodel=_records(mm_fcst),
         ensemble_stats=_records(ens_fcst),
+        postproc_daily=pp_daily,
     )
