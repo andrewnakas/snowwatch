@@ -32,9 +32,18 @@ FB_BAND = (0.8, 1.3)
 FB_BAND_RARE = (0.8, 1.5)
 RARE_THRESHOLD_IN = 6.0
 
+# Gates are TUNED against a band shrunk toward center: FB drifts between the
+# calibration slice and the verification season (observed 2026-07-06: gates
+# tuned to FB<=1.3 on the Oct-Nov tail realized FB 1.55 in Dec-Feb). Aiming
+# at the center keeps realized FB inside the pre-registered reporting band
+# [0.8, 1.3] ([0.8, 1.5] rare), which is what W2 is judged against.
+FB_TUNE_BAND = (0.85, 1.15)
+FB_TUNE_BAND_RARE = (0.85, 1.3)
+
 
 def fb_band_for(threshold_in: float) -> tuple[float, float]:
-    return FB_BAND_RARE if threshold_in >= RARE_THRESHOLD_IN else FB_BAND
+    """Tuning band (aim-center). Reporting band stays FB_BAND/FB_BAND_RARE."""
+    return FB_TUNE_BAND_RARE if threshold_in >= RARE_THRESHOLD_IN else FB_TUNE_BAND
 
 
 def lead_bucket(lead_days: int) -> str:
