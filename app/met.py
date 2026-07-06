@@ -352,7 +352,8 @@ def fetch_profile(lat: float, lon: float, days: int = 7, *, max_age_hours: float
 # ---------- 2m phase variables (wet-bulb / freezing level, v1.6 Tier 1) -----
 
 PHASE_MODELS = "gfs025,ncep_nbm_conus"
-PHASE_VARS = ("temperature_2m", "relative_humidity_2m", "freezing_level_height")
+PHASE_VARS = ("temperature_2m", "relative_humidity_2m",
+              "freezing_level_height", "wind_speed_10m")
 
 
 def fetch_phase_hourly(lat: float, lon: float, days: int = 7, *,

@@ -55,7 +55,7 @@ FEATURE_GROUPS = {
     "ens": ["ens_snow_mean_cm", "ens_snow_std_cm", "ens_snow_p10_cm",
             "ens_snow_p50_cm", "ens_snow_p90_cm", "ens_prob_pos",
             "ens_precip_mean_mm", "ens_precip_std_mm"],
-    "phase": ["wb_mean_c", "wb_min_c", "hours_wb_below_0"],
+    "phase": ["wb_mean_c", "wb_min_c", "hours_wb_below_0", "wind10_mean_ms"],
     "hrrr_native": ["hrrr_native_snowfall_cm"],
 }
 NUMERIC_FEATURES = BASE_FEATURES + [c for g in FEATURE_GROUPS.values() for c in g]

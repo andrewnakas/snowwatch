@@ -82,10 +82,23 @@ def live_phase_daily(phase_hourly: pd.DataFrame) -> pd.DataFrame:
                    if c in phase_hourly.columns), None)
     if t_col is None or rh_col is None:
         return pd.DataFrame(columns=["valid_date", "wb_mean_c", "wb_min_c",
-                                     "hours_wb_below_0"])
+                                     "hours_wb_below_0", "wind10_mean_ms"])
     out = phase_frame_from_hourly(phase_hourly, time_col="datetime",
                                   t_col=t_col, rh_col=rh_col, fl_col=None)
-    return out[["valid_date", "wb_mean_c", "wb_min_c", "hours_wb_below_0"]]
+    # wind10: Open-Meteo serves speed directly (km/h) — convert to m/s to
+    # match the training tree (|u,v| from the GFS archive).
+    w_col = next((c for c in ("wind_speed_10m_gfs025", "wind_speed_10m")
+                  if c in phase_hourly.columns), None)
+    if w_col is not None:
+        w = phase_hourly[["datetime", w_col]].copy()
+        w["valid_date"] = pd.to_datetime(w["datetime"]).dt.strftime("%Y-%m-%d")
+        wind = (pd.to_numeric(w[w_col], errors="coerce") / 3.6).groupby(
+            w["valid_date"]).mean().rename("wind10_mean_ms").reset_index()
+        out = out.merge(wind, on="valid_date", how="left")
+    else:
+        out["wind10_mean_ms"] = np.nan
+    return out[["valid_date", "wb_mean_c", "wb_min_c", "hours_wb_below_0",
+                "wind10_mean_ms"]]
 
 
 def phase_frame_from_hourly(

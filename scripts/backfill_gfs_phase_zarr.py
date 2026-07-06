@@ -46,8 +46,11 @@ from scripts.backfill_gfs_zarr import (  # noqa: E402
 
 STATE_PATH = ROOT / "data" / "prevruns" / "gfs_phase_state.json"
 OUT_ROOT = ROOT / "data" / "prevruns" / "gfs_phase"
-VARS = ["temperature_2m", "relative_humidity_2m"]
-OUT_COLS = ["valid_date", "lead_days", "wb_mean_c", "wb_min_c", "hours_wb_below_0"]
+# wind10: mean 10m speed — with temperature and humidity it's the third
+# top predictor in the published SLR work (Veals et al. 2025).
+VARS = ["temperature_2m", "relative_humidity_2m", "wind_u_10m", "wind_v_10m"]
+OUT_COLS = ["valid_date", "lead_days", "wb_mean_c", "wb_min_c",
+            "hours_wb_below_0", "wind10_mean_ms"]
 INIT_BATCH = 6
 
 
@@ -89,6 +92,7 @@ def _extract_inits(ds, init_ts, stations) -> pd.DataFrame:
     rh = _interp("relative_humidity_2m")
     wb = _wb_vec(t2m, rh)                       # (init, lead, station)
     wb[np.isnan(t2m) | np.isnan(rh)] = np.nan
+    wind = np.hypot(_interp("wind_u_10m"), _interp("wind_v_10m"))
 
     rows = []
     for n in LEADS:
@@ -101,11 +105,14 @@ def _extract_inits(ds, init_ts, stations) -> pd.DataFrame:
             wb_mean = np.nanmean(w, axis=1)
             wb_min = np.nanmin(w, axis=1)
             hrs = np.nansum(w <= 0.0, axis=1) * 24.0 / np.maximum(n_valid, 1)
+        with np.errstate(all="ignore"):
+            wind_mean = np.nanmean(wind[:, ins, :], axis=1)
         bad = n_valid < 4
         wb_mean[bad] = np.nan
         wb_min[bad] = np.nan
         hrs = hrs.astype(float)
         hrs[bad] = np.nan
+        wind_mean[bad] = np.nan
         for k, it in enumerate(init_ts):
             vd = (it + pd.Timedelta(days=n)).strftime("%Y-%m-%d")
             rows.append(pd.DataFrame({
@@ -113,6 +120,7 @@ def _extract_inits(ds, init_ts, stations) -> pd.DataFrame:
                 "wb_mean_c": np.round(wb_mean[k], 2),
                 "wb_min_c": np.round(wb_min[k], 2),
                 "hours_wb_below_0": np.round(hrs[k], 1),
+                "wind10_mean_ms": np.round(wind_mean[k], 2),
             }))
     if not rows:
         return pd.DataFrame(columns=["triplet", *OUT_COLS])

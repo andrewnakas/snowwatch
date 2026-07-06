@@ -55,7 +55,7 @@ GEFS_ENS_COLS = ["ens_snow_mean_cm", "ens_snow_std_cm", "ens_snow_p10_cm",
                  "ens_snow_p50_cm", "ens_snow_p90_cm", "ens_prob_pos",
                  "ens_precip_mean_mm", "ens_precip_std_mm", "ens_n_members",
                  "z500_mean_m"]
-GFS_PHASE_COLS = ["wb_mean_c", "wb_min_c", "hours_wb_below_0"]
+GFS_PHASE_COLS = ["wb_mean_c", "wb_min_c", "hours_wb_below_0", "wind10_mean_ms"]
 
 
 def _read_aux_tree(tree: str, triplet: str, cols: list[str]) -> pd.DataFrame:
