@@ -206,14 +206,20 @@ ENS_COLS = [
 ]
 
 
-def _ens_reduce(payload: dict) -> pd.DataFrame:
-    """Reduce raw per-member ensemble daily values to spread stats per day."""
+def _ens_reduce(payload: dict, *, model_filter: str = "") -> pd.DataFrame:
+    """Reduce raw per-member ensemble daily values to spread stats per day.
+
+    model_filter: substring the member keys must contain (payload keys are
+    per-model suffixed, e.g. snowfall_sum_member01_ncep_gefs025). Empty =
+    all members (the site's mixed GEFS+AIFS view); "_ncep_gefs025" = the
+    GEFS-only stats that match the gefs_ens training tree.
+    """
     daily = payload.get("daily") or {}
     times = daily.get("time")
     if not times:
         return pd.DataFrame(columns=["date"] + ENS_COLS)
-    snow_cols = [k for k in daily if k.startswith("snowfall_sum")]
-    precip_cols = [k for k in daily if k.startswith("precipitation_sum")]
+    snow_cols = [k for k in daily if k.startswith("snowfall_sum") and model_filter in k]
+    precip_cols = [k for k in daily if k.startswith("precipitation_sum") and model_filter in k]
     snow = np.array([daily[k] for k in snow_cols], dtype=float)    # (members, days)
     precip = np.array([daily[k] for k in precip_cols], dtype=float)
     rows = []
@@ -276,6 +282,13 @@ def fetch_ensemble(lat: float, lon: float, days: int = 7, *, max_age_hours: floa
     if payload is None or "daily" not in payload:
         return _cached_or_empty("ens", lat, lon, _from_cache, ["date"] + ENS_COLS)
     df = _ens_reduce(payload)
+    # GEFS-only stats alongside (gefs_ prefix): the post-processor's ens
+    # features must come from the same member population it trained on
+    # (gefs_ens tree = 31 GEFS members), not the mixed GEFS+AIFS cloud.
+    gefs = _ens_reduce(payload, model_filter="_ncep_gefs025")
+    if not gefs.empty:
+        df = df.merge(gefs.rename(columns={c: f"gefs_{c}" for c in ENS_COLS}),
+                      on="date", how="left")
     try:
         ser = df.copy()
         ser["date"] = ser["date"].astype(str)

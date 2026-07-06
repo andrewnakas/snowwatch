@@ -96,16 +96,17 @@ def nbm_version_for(d: str) -> str:
     return "v4.2"
 
 
-# Live ensemble frame (app/met.py ENS_COLS, values already cm/mm) → the
-# training column names from the gefs_ens tree. NOTE the live reduction
-# currently mixes GEFS+AIFS members while training is GEFS-only — the ens
-# group ships to production only after the live reduction is restricted to
-# GEFS and check_feature_skew clears it.
+# Live ensemble frame (app/met.py) → the training column names from the
+# gefs_ens tree. The gefs_-prefixed columns are the GEFS-only reduction —
+# the member population training used; the mixed GEFS+AIFS stats exist for
+# the site UI and are NOT fed to the model. Old caches without the gefs_
+# columns simply leave the features NaN.
 ENS_LIVE_TO_TRAIN = {
-    "ens_snow_mean": "ens_snow_mean_cm", "ens_snow_std": "ens_snow_std_cm",
-    "ens_snow_p10": "ens_snow_p10_cm", "ens_snow_p50": "ens_snow_p50_cm",
-    "ens_snow_p90": "ens_snow_p90_cm", "ens_snow_prob_pos": "ens_prob_pos",
-    "ens_precip_mean": "ens_precip_mean_mm", "ens_precip_std": "ens_precip_std_mm",
+    "gefs_ens_snow_mean": "ens_snow_mean_cm", "gefs_ens_snow_std": "ens_snow_std_cm",
+    "gefs_ens_snow_p10": "ens_snow_p10_cm", "gefs_ens_snow_p50": "ens_snow_p50_cm",
+    "gefs_ens_snow_p90": "ens_snow_p90_cm", "gefs_ens_snow_prob_pos": "ens_prob_pos",
+    "gefs_ens_precip_mean": "ens_precip_mean_mm",
+    "gefs_ens_precip_std": "ens_precip_std_mm",
 }
 
 
