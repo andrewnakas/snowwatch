@@ -140,6 +140,11 @@ jobs:
         # TOTAL_SHARDS=4, require 3 (one stray eviction tolerated).
         run: python scripts/merge_shards.py --input-root shard_dists --min-shards 3
 
+      - name: Build verification scorecard page
+        # Static assembly from committed benchmarks/*.json — no NWP calls.
+        # Failures must not block the site deploy.
+        run: python scripts/build_scorecard.py || echo "scorecard skipped"
+
       - name: Append forecast archive to monthly Release asset
         # Headerless gzip CSV streams are byte-appendable; the monthly asset
         # grows by simple concat. The release is created on first use.
