@@ -84,7 +84,8 @@ PROFILE_VARS = ("temperature", "relative_humidity", "wind_speed", "geopotential_
 # Open-Meteo's free tier weights a call by variables×days×models. These are
 # deliberately conservative estimates; the point is graceful degradation, not
 # precise accounting. Reset per process (one shard build = one process).
-_COST = {"multimodel": 7.0, "ensemble": 22.0, "profile": 4.0, "other": 1.0}
+_COST = {"multimodel": 7.0, "ensemble": 22.0, "profile": 4.0, "phase": 3.0,
+         "other": 1.0}
 _DEFAULT_BUDGET = float(os.environ.get("SW_MET_BUDGET", "9000"))
 _spent = 0.0
 _consecutive_429 = 0
@@ -331,6 +332,54 @@ def fetch_profile(lat: float, lon: float, days: int = 7, *, max_age_hours: float
     payload = _http_json(FORECAST_URL + "?" + urlencode(params), timeout=90)
     if payload is None or "hourly" not in payload:
         return _cached_or_empty("prof", lat, lon, _to_df, [])
+    cache.write_text(json.dumps(payload, separators=(",", ":")))
+    return _to_df(payload)
+
+
+# ---------- 2m phase variables (wet-bulb / freezing level, v1.6 Tier 1) -----
+
+PHASE_MODELS = "gfs025,ncep_nbm_conus"
+PHASE_VARS = ("temperature_2m", "relative_humidity_2m", "freezing_level_height")
+
+
+def fetch_phase_hourly(lat: float, lon: float, days: int = 7, *,
+                       max_age_hours: float = 5.0) -> pd.DataFrame:
+    """Hourly-6 t2m/rh2m/freezing-level per model (GFS + NBM) for the phase
+    features (app/phase_features.py). Storm-gate at the caller — same rule as
+    fetch_profile: only when meaningful QPF is in the consensus, which keeps
+    it out of ~75% of station-builds. Columns come back per-model suffixed
+    (temperature_2m_gfs025, ..._ncep_nbm_conus); NaN where a model lacks the
+    variable — downstream aggregation is NaN-native.
+    """
+    cache = CACHE_DIR / f"phase_{lat:.3f}_{lon:.3f}_{days}.json"
+
+    def _to_df(payload: dict) -> pd.DataFrame:
+        hourly = payload.get("hourly") or {}
+        if not hourly.get("time"):
+            return pd.DataFrame()
+        return pd.DataFrame(hourly).rename(columns={"time": "datetime"})
+
+    if _no_fetch():
+        return _cached_or_empty("phase", lat, lon, _to_df, [])
+    if cache.exists() and (time.time() - cache.stat().st_mtime) < max_age_hours * 3600:
+        try:
+            return _to_df(json.loads(cache.read_text()))
+        except Exception:
+            pass
+    if not _charge("phase"):
+        return _cached_or_empty("phase", lat, lon, _to_df, [])
+    params = {
+        "latitude": f"{lat:.4f}",
+        "longitude": f"{lon:.4f}",
+        "hourly": ",".join(PHASE_VARS),
+        "forecast_days": days,
+        "timezone": "UTC",
+        "models": PHASE_MODELS,
+        "temporal_resolution": "hourly_6",
+    }
+    payload = _http_json(FORECAST_URL + "?" + urlencode(params), timeout=90)
+    if payload is None or "hourly" not in payload:
+        return _cached_or_empty("phase", lat, lon, _to_df, [])
     cache.write_text(json.dumps(payload, separators=(",", ":")))
     return _to_df(payload)
 
