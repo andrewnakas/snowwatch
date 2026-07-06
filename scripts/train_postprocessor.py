@@ -55,16 +55,20 @@ CAL_TAIL_DAYS = 60
 # original 2026-02-28 cutoff (test = melt season, kept as the cautionary
 # comparison, not as evidence).
 FOLDS = {
-    # Calibration slice: default last-CAL_TAIL_DAYS tail. A season-matched
-    # prior-winter window (cal_start/cal_end per fold) was tried 2026-07-06
-    # and made everything worse — with ~1.3 winters of pairs it removes the
-    # only other core winter from training (MAE 0.714→0.809, CSI@6
-    # 0.197→0.139). Revisit season-matched windows once the Zarr backfill
-    # delivers 5 winters; the mechanism (evaluate_split cal_window) stays.
+    # Calibration slice: season-matched prior-year window (test window
+    # shifted back one year), cut out of training. History: FAILED at 98
+    # stations × 1.3 winters (removed the only other core winter; MAE
+    # 0.714→0.809). REQUIRED at 912 stations × 5 winters: the last-60-days
+    # tail (Oct–Nov) is nearly empty of ≥6in events, so the gate tuner
+    # found no valid 6/12in gates at most lead buckets and fold-A CSI@6
+    # collapsed 0.197→0.104 (2026-07-06). Three other core winters remain
+    # in training, so the cost that killed it before is gone.
     "A_core_winter": {"train_end": "2025-11-30",
-                      "test_start": "2025-12-01", "test_end": "2026-02-28"},
+                      "test_start": "2025-12-01", "test_end": "2026-02-28",
+                      "cal_start": "2024-12-01", "cal_end": "2025-02-28"},
     "B_spring": {"train_end": "2026-02-28",
-                 "test_start": "2026-02-28", "test_end": None},
+                 "test_start": "2026-02-28", "test_end": None,
+                 "cal_start": "2025-02-28", "cal_end": "2025-06-15"},
 }
 
 

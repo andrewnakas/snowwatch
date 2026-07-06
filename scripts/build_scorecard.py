@@ -37,6 +37,7 @@ SOURCE_LABELS = {
     "postproc_l1": "MAE-optimal head (cautionary)",
 }
 METRIC_COLS = [
+    ("n", "n", ",d"),
     ("mae", "MAE (in)", "0.3f"), ("bias", "Bias", "+.3f"),
     ("event_mae", "Event MAE", "0.3f"),
     ("csi_1in", "CSI@1\"", "0.3f"), ("pod_1in", "POD@1\"", "0.3f"),
@@ -52,7 +53,7 @@ def _fmt(v, spec):
     if v is None:
         return "—"
     try:
-        return format(float(v), spec)
+        return format(int(v) if spec.endswith("d") else float(v), spec)
     except (TypeError, ValueError):
         return "—"
 
@@ -190,7 +191,10 @@ definitions: <code>app/verification.py</code>; win conditions pre-registered in
 {fold_table}
 <p class="note">FB = frequency bias (1.0 unbiased). The MAE-optimal head is
 shown as the cautionary exhibit: lowest MAE, collapsed event detection —
-why MAE alone is never the headline.</p>
+why MAE alone is never the headline. <b>Rows cover different populations</b>
+(NBM exists at a subset of stations; n column) — cross-row comparison is
+indicative only. The paired bootstrap deltas below are computed on shared
+rows and are the arbiter of every head-to-head claim.</p>
 
 <h2>Significance (station-week block bootstrap, 95% CI)</h2>
 <ul>{bootstrap_list}</ul>
