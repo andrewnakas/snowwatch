@@ -149,8 +149,24 @@ def main() -> int:
         inits = [d for d in _month_days(ym) if d < today]
         init_all = pd.to_datetime([d.isoformat() for d in inits])
         init_all = init_all[init_all.isin(pd.to_datetime(ds.init_time.values))]
-        frames = [_extract_inits(ds, init_all[i:i + INIT_BATCH], stations)
-                  for i in range(0, len(init_all), INIT_BATCH)]
+        frames = []
+        failed = False
+        for i in range(0, len(init_all), INIT_BATCH):
+            for attempt in range(4):
+                try:
+                    frames.append(_extract_inits(ds, init_all[i:i + INIT_BATCH], stations))
+                    break
+                except Exception as exc:   # transient S3 resets kill hours
+                    print(f"{ym} batch {i}: attempt {attempt+1} failed "
+                          f"({type(exc).__name__}: {str(exc)[:100]})", flush=True)
+                    time.sleep(30 * (attempt + 1))
+            else:
+                failed = True
+                break
+        if failed:
+            print(f"{ym}: giving up — rerun later")
+            ym = nxt
+            continue
         frames = [f for f in frames if not f.empty]
         n = 0
         if frames:

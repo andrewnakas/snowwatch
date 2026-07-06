@@ -206,6 +206,8 @@ Bin sample sizes shown as dot area.</p>
 
 {live_section}
 
+{truth_section}
+
 <script>
 const REL = {rel_json};
 function drawRel(thr, rows) {{
@@ -254,6 +256,32 @@ def live_section_html(live: dict | None) -> str:
             + "".join(rows) + "</tbody></table>")
 
 
+def truth_section_html(agree: dict | None) -> str:
+    if not agree:
+        return ""
+    def row(label, s):
+        if not s:
+            return ""
+        return (f"<tr><td>{html.escape(label)}</td><td>{s['n']:,}</td>"
+                f"<td>{_fmt(s.get('r'), '0.2f')}</td>"
+                f"<td>{_fmt(s.get('mean_t1'), '0.2f')}</td>"
+                f"<td>{_fmt(s.get('mean_t2'), '0.2f')}</td>"
+                f"<td>{_fmt(s.get('event_agreement_1in'), '0.2f')}</td></tr>")
+    return (
+        "<h2>How much do the truths agree?</h2>"
+        "<p class='note'>SNOTEL ultrasonic depth change (T1) vs NOHRSC human "
+        f"observer reports (T2) within {agree.get('radius_km')} km. They agree "
+        "only weakly — settlement-netted sensor vs cleared board, UTC vs "
+        "local-morning windows, ridge vs valley sites. That disagreement is "
+        "the floor on how precisely ANY system can be scored here; it is why "
+        "T2 is a separate verification track and never a swap-in truth.</p>"
+        "<table><thead><tr><th>Match</th><th>n</th><th>r</th><th>mean T1</th>"
+        "<th>mean T2</th><th>event agr.@1\"</th></tr></thead><tbody>"
+        + row("day-matched", agree.get("day_matched"))
+        + row("3-day storm totals", agree.get("storm_total_3d"))
+        + "</tbody></table>")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=OUT_DIR)
@@ -272,6 +300,8 @@ def main() -> int:
         return 1
     published = _load(ROOT / "benchmarks" / "published.json") or {}
     live = _load(ROOT / "data" / "verify" / "live_scorecard.json")
+    agree = (_load(ROOT / "data" / "verify" / "truth_agreement.json")
+             or _load(ROOT / "benchmarks" / "truth_agreement.json"))
 
     page = PAGE.format(
         generated=date.today().isoformat(),
@@ -283,6 +313,7 @@ def main() -> int:
         bootstrap_list=bootstrap_lines(fold),
         rel_json=json.dumps(reliability_json(fold)),
         live_section=live_section_html(live),
+        truth_section=truth_section_html(agree),
     )
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "index.html").write_text(page)

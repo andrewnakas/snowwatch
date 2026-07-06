@@ -1,0 +1,54 @@
+{
+  "radius_km": 5.0,
+  "day_matched": {
+    "n": 8274,
+    "r": 0.104,
+    "mean_t1": 0.707,
+    "mean_t2": 2.634,
+    "mad": 2.733,
+    "event_agreement_1in": 0.207
+  },
+  "storm_total_3d": {
+    "n": 5602,
+    "r": 0.261,
+    "mean_t1": 2.449,
+    "mean_t2": 5.933,
+    "mad": 5.237,
+    "event_agreement_1in": 0.391
+  },
+  "note": "day_matched is depressed by 24h-window offsets (local-morning observer windows vs UTC SNOTEL days); storm_total_3d is the meaningful agreement statistic",
+  "by_delev": {
+    "obs \u226b lower": {
+      "n": 335,
+      "r": 0.095,
+      "mean_t1": 0.609,
+      "mean_t2": 0.758,
+      "mad": 1.067,
+      "event_agreement_1in": 0.189
+    },
+    "obs lower": {
+      "n": 1533,
+      "r": 0.013,
+      "mean_t1": 0.572,
+      "mean_t2": 0.915,
+      "mad": 1.308,
+      "event_agreement_1in": 0.127
+    },
+    "co-elevation": {
+      "n": 6304,
+      "r": 0.109,
+      "mean_t1": 0.742,
+      "mean_t2": 3.06,
+      "mad": 3.09,
+      "event_agreement_1in": 0.218
+    },
+    "obs higher": {
+      "n": 102,
+      "r": 0.139,
+      "mean_t1": 0.941,
+      "mean_t2": 8.285,
+      "mad": 7.54,
+      "event_agreement_1in": 0.228
+    }
+  }
+}

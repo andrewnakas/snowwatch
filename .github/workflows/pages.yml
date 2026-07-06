@@ -76,6 +76,21 @@ jobs:
         # the committed catalogue with a bad pull, so fall back to it.
         run: python scripts/fetch_stations.py || echo "AWDB unreachable; using committed station catalogue"
 
+      - name: Restore trained post-processor models
+        # models.tar.gz is uploaded manually after a local retrain that passed
+        # the fold gates + check_feature_skew (see benchmarks/published.json).
+        # The postproc member additionally requires SW_ENABLE_POSTPROC=1 (set
+        # in the build step env once the release gates are green) — missing
+        # asset or unset flag both degrade gracefully to the v1.5 members.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release download training-data --pattern models.tar.gz --output models.tar.gz 2>/dev/null; then
+            tar -xzf models.tar.gz && echo "restored $(ls data/models | wc -l) model files"
+          else
+            echo "no models.tar.gz on the training-data Release; postproc member stays off"
+          fi
+
       - name: Decide ensemble fetch window
         # Member-level ensemble pulls are the heaviest Open-Meteo calls; do
         # them on the 00Z and 12Z builds only. Other builds reuse the <=11h

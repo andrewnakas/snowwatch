@@ -1,0 +1,64 @@
+# Weekly as-issued verification + NOHRSC truth accrual.
+#
+# verify_live.py scores archived forecasts (forecast-archive Release) against
+# QC'd SNOTEL obs exactly as published; the rolling scorecard uploads to the
+# training-data Release, where build_scorecard.py picks it up at the next
+# site deploy. fetch_nohrsc.py appends the previous week of observer reports
+# to the nohrsc-truth Release asset tree.
+name: verify
+
+on:
+  schedule:
+    - cron: "45 9 * * 1"     # Mondays 09:45 UTC — after the 06:00 site build
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: verify
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: training-data
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Rolling as-issued scorecard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/verify_live.py --window-days 90 || echo "no archive yet"
+
+      - name: Fetch last week of NOHRSC observer reports
+        run: |
+          python scripts/fetch_nohrsc.py \
+            --start "$(date -u -d '8 days ago' +%F)" \
+            --end "$(date -u -d 'yesterday' +%F)" --sleep 1.5
+
+      - name: Upload verification artifacts to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --title "Training data" \
+              --notes "Backfill state + verification artifacts"
+          if [ -f data/verify/live_scorecard.json ]; then
+            gh release upload "$RELEASE_TAG" data/verify/live_scorecard.json --clobber
+          fi
+          if ls data/truth/nohrsc/*.csv.gz >/dev/null 2>&1; then
+            tar -czf nohrsc-truth-recent.tar.gz data/truth/nohrsc
+            gh release upload "$RELEASE_TAG" nohrsc-truth-recent.tar.gz --clobber
+          fi
