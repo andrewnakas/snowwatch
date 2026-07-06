@@ -102,7 +102,8 @@ def fit_calibration(boosters: dict, cal_df: pd.DataFrame) -> dict:
 
 def evaluate_split(train_df: pd.DataFrame, test_df: pd.DataFrame, *,
                    label: str, n_boot: int = 1000,
-                   cal_window: tuple[str, str] | None = None) -> tuple[dict, dict, dict | None]:
+                   cal_window: tuple[str, str] | None = None,
+                   feature_groups: tuple[str, ...] | None = None) -> tuple[dict, dict, dict | None]:
     """Train on train_df (minus a calibration slice), calibrate on the slice,
     score on test_df. Returns (metrics, boosters, calib).
 
@@ -123,7 +124,7 @@ def evaluate_split(train_df: pd.DataFrame, test_df: pd.DataFrame, *,
     cal_df = train_df[in_cal]
     if inner_df.empty or len(cal_df) < 500:
         inner_df, cal_df = train_df, train_df.iloc[0:0]
-    boosters = postproc.train(inner_df)
+    boosters = postproc.train(inner_df, feature_groups=feature_groups)
     calib = None
     if not cal_df.empty and any(k.startswith("exc_") for k in boosters):
         calib = fit_calibration(boosters, cal_df)
@@ -291,6 +292,14 @@ def main() -> int:
                     help="test-period start date (default: last 20%% of dates)")
     ap.add_argument("--folds", action="store_true",
                     help="evaluate the named temporal folds (no models saved)")
+    ap.add_argument("--ablate", action="store_true",
+                    help="fold-A ablation over Phase-3 feature groups "
+                         "(base / +ens / +phase / +hrrr_native / all)")
+    ap.add_argument("--feature-groups", default=None,
+                    help="comma-separated Phase-3 groups to include "
+                         "(default: all; 'none' = base only). Production "
+                         "saves should name only groups whose LIVE source "
+                         "exists and passed check_feature_skew")
     ap.add_argument("--out", type=Path, default=postproc.MODELS_DIR)
     ap.add_argument("--no-save", action="store_true")
     args = ap.parse_args()
@@ -301,6 +310,36 @@ def main() -> int:
         print("no usable pairs — build training data first")
         return 1
     print(f"{len(pairs)} usable pairs, {pairs['triplet'].nunique()} stations")
+
+    groups: tuple[str, ...] | None = None
+    if args.feature_groups is not None:
+        groups = (tuple() if args.feature_groups == "none"
+                  else tuple(g.strip() for g in args.feature_groups.split(",")))
+
+    if args.ablate:
+        f = FOLDS["A_core_winter"]
+        train_df = pairs[pairs["valid_date"] < f["train_end"]]
+        test_df = pairs[(pairs["valid_date"] >= f["test_start"])
+                        & (pairs["valid_date"] <= f["test_end"])]
+        results = {}
+        variants: list[tuple[str, tuple[str, ...] | None]] = [
+            ("base", tuple()),
+            *[(f"+{g}", (g,)) for g in postproc.FEATURE_GROUPS],
+            ("all", None),
+        ]
+        for name, gset in variants:
+            m, _, _ = evaluate_split(train_df, test_df,
+                                     label=f"ablate:{name}", n_boot=300,
+                                     feature_groups=gset)
+            results[name] = {k: m["sources"]["postproc"].get(k) for k in
+                             ("mae", "bias", "csi_1in", "csi_2in", "csi_6in",
+                              "csi_12in", "pod_6in", "fb_6in")}
+            results[name]["crps"] = m.get("crps_postproc")
+        out_path = args.out / "metrics_ablation.json"
+        args.out.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(results, indent=2, default=float))
+        print(f"\nwrote ablation table -> {out_path}")
+        return 0
 
     if args.folds:
         results = {}
@@ -314,7 +353,8 @@ def main() -> int:
                 continue
             cal_w = (f["cal_start"], f["cal_end"]) \
                 if f.get("cal_start") and f.get("cal_end") else None
-            m, _, _ = evaluate_split(train_df, test_df, label=name, cal_window=cal_w)
+            m, _, _ = evaluate_split(train_df, test_df, label=name,
+                                     cal_window=cal_w, feature_groups=groups)
             m["fold"] = f
             results[name] = m
         out_path = args.out / "metrics_folds.json"
@@ -330,11 +370,15 @@ def main() -> int:
     if train_df.empty or test_df.empty:
         print("degenerate split — adjust --cutoff")
         return 1
-    metrics, boosters, calib = evaluate_split(train_df, test_df, label=f"cutoff_{cutoff}")
+    metrics, boosters, calib = evaluate_split(train_df, test_df,
+                                              label=f"cutoff_{cutoff}",
+                                              feature_groups=groups)
     metrics["cutoff"] = cutoff
 
     if not args.no_save:
-        meta = {"features": postproc.FEATURES, "quantiles": list(postproc.QUANTILES),
+        meta = {"features": postproc.feature_list(groups),
+                "feature_groups": (sorted(groups) if groups is not None else "all"),
+                "quantiles": list(postproc.QUANTILES),
                 "event_thresholds": list(postproc.EVENT_THRESHOLDS),
                 "trained_through": cutoff, "metrics": metrics}
         postproc.save(boosters, models_dir=args.out, meta=meta)

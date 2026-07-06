@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -35,7 +35,7 @@ MODELS_DIR = Path(__file__).resolve().parents[1] / "data" / "models"
 
 QUANTILES = (0.05, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 0.95)
 
-NUMERIC_FEATURES = [
+BASE_FEATURES = [
     "nbm_snowfall_cm", "nbm_precip_mm", "nbm_tmean_c",
     "hrrr_snowfall_cm", "hrrr_precip_mm", "hrrr_tmean_c",
     "gfs_snowfall_cm", "gfs_precip_mm", "gfs_tmean_c",
@@ -47,8 +47,30 @@ NUMERIC_FEATURES = [
     "elevation_ft", "lat", "lon", "median_slr",
     "obs_depth_issue_in", "obs_swe_issue_in",
 ]
+# Phase-3 groups, ablatable via train(feature_groups=...). z500_mean_m and
+# ens_n_members are deliberately EXCLUDED until the live source matches the
+# training source (GEFS-only reduction; z500 has no live feed yet) and
+# check_feature_skew clears them — see plan, train/serve skew rule.
+FEATURE_GROUPS = {
+    "ens": ["ens_snow_mean_cm", "ens_snow_std_cm", "ens_snow_p10_cm",
+            "ens_snow_p50_cm", "ens_snow_p90_cm", "ens_prob_pos",
+            "ens_precip_mean_mm", "ens_precip_std_mm"],
+    "phase": ["wb_mean_c", "wb_min_c", "hours_wb_below_0"],
+    "hrrr_native": ["hrrr_native_snowfall_cm"],
+}
+NUMERIC_FEATURES = BASE_FEATURES + [c for g in FEATURE_GROUPS.values() for c in g]
 CATEGORICAL_FEATURES = ["snow_class", "nbm_version"]
 FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
+
+
+def feature_list(groups: Optional[Iterable[str]] = None) -> list[str]:
+    """FEATURES restricted to base + the named groups (None = all groups)."""
+    if groups is None:
+        return FEATURES
+    cols = list(BASE_FEATURES)
+    for g in groups:
+        cols += FEATURE_GROUPS[g]
+    return cols + CATEGORICAL_FEATURES
 
 LGB_PARAMS = {
     "objective": "quantile",
@@ -74,9 +96,24 @@ def nbm_version_for(d: str) -> str:
     return "v4.2"
 
 
+# Live ensemble frame (app/met.py ENS_COLS, values already cm/mm) → the
+# training column names from the gefs_ens tree. NOTE the live reduction
+# currently mixes GEFS+AIFS members while training is GEFS-only — the ens
+# group ships to production only after the live reduction is restricted to
+# GEFS and check_feature_skew clears it.
+ENS_LIVE_TO_TRAIN = {
+    "ens_snow_mean": "ens_snow_mean_cm", "ens_snow_std": "ens_snow_std_cm",
+    "ens_snow_p10": "ens_snow_p10_cm", "ens_snow_p50": "ens_snow_p50_cm",
+    "ens_snow_p90": "ens_snow_p90_cm", "ens_snow_prob_pos": "ens_prob_pos",
+    "ens_precip_mean": "ens_precip_mean_mm", "ens_precip_std": "ens_precip_std_mm",
+}
+
+
 def build_inference_features(
     mm_fcst: pd.DataFrame, *, statics: dict, last_depth: Optional[float],
     last_swe: Optional[float], issue_date, horizon: int,
+    ens_fcst: Optional[pd.DataFrame] = None,
+    phase_daily: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Pairs-shaped frame (one row per forecast day) from the live multimodel
     frame, mirroring scripts/build_training_data.py exactly — any drift
@@ -84,6 +121,10 @@ def build_inference_features(
 
     mm_fcst columns are `{model}_{snowfall|precip|tmean}` (app/met.py);
     training columns are `{model}_{snowfall_cm|precip_mm|tmean_c}`.
+    ens_fcst: live ensemble stats (met.fetch_ensemble), mapped via
+    ENS_LIVE_TO_TRAIN. phase_daily: daily wet-bulb aggregates keyed by
+    valid_date (met.fetch_phase_hourly → phase_features). Absent sources
+    leave their columns NaN — LightGBM routes them natively.
     """
     rows = []
     for _, r in (mm_fcst if mm_fcst is not None else pd.DataFrame()).iterrows():
@@ -119,6 +160,24 @@ def build_inference_features(
     df["nbm_version"] = df["valid_date"].map(nbm_version_for)
     df["obs_depth_issue_in"] = last_depth
     df["obs_swe_issue_in"] = last_swe
+
+    # Phase-3 group columns — populated from their live frames when passed,
+    # NaN otherwise (hrrr_native has no live source yet; see FEATURE_GROUPS).
+    for cols in FEATURE_GROUPS.values():
+        for c in cols:
+            df[c] = np.nan
+    if ens_fcst is not None and not ens_fcst.empty:
+        e = ens_fcst.copy()
+        e["valid_date"] = e["date"].astype(str)
+        e = e.rename(columns=ENS_LIVE_TO_TRAIN)
+        keep = ["valid_date"] + [c for c in ENS_LIVE_TO_TRAIN.values() if c in e.columns]
+        df = df.drop(columns=[c for c in keep if c != "valid_date"]).merge(
+            e[keep], on="valid_date", how="left")
+    if phase_daily is not None and not phase_daily.empty:
+        p = phase_daily.copy()
+        pcols = [c for c in FEATURE_GROUPS["phase"] if c in p.columns]
+        df = df.drop(columns=pcols).merge(
+            p[["valid_date"] + pcols], on="valid_date", how="left")
     return df
 
 
@@ -130,18 +189,21 @@ def usable_rows(pairs: pd.DataFrame) -> pd.DataFrame:
     return pairs[ok]
 
 
-def build_features(pairs: pd.DataFrame) -> pd.DataFrame:
-    """Feature frame in FEATURES order. Missing columns become all-NaN so a
-    model trained on full coverage still scores thin early datasets."""
+def build_features(pairs: pd.DataFrame, features: Optional[list[str]] = None) -> pd.DataFrame:
+    """Feature frame in `features` order (default FEATURES). Missing columns
+    become all-NaN so a model trained on full coverage still scores thin
+    early datasets."""
+    features = features or FEATURES
     df = pairs.copy()
     doy = pd.to_numeric(df.get("doy"), errors="coerce")
     df["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)
     df["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
-    for c in NUMERIC_FEATURES:
-        df[c] = pd.to_numeric(df.get(c), errors="coerce")
-    for c in CATEGORICAL_FEATURES:
-        df[c] = df.get(c, pd.Series(index=df.index, dtype=object)).astype("category")
-    return df[FEATURES]
+    for c in features:
+        if c in CATEGORICAL_FEATURES:
+            df[c] = df.get(c, pd.Series(index=df.index, dtype=object)).astype("category")
+        else:
+            df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    return df[features]
 
 
 # Snowfall is a zero-inflated continuous target: >90% of station-days are
@@ -174,7 +236,8 @@ def _exc_key(thr: float) -> str:
     return f"exc_{thr:g}".replace(".", "p")
 
 
-def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROUNDS) -> dict:
+def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROUNDS,
+          feature_groups: Optional[Iterable[str]] = None) -> dict:
     """Train quantile boosters + a Tweedie point booster (+ an L1 head for
     comparison). Returns {name: Booster} with `point` = the production model.
 
@@ -185,7 +248,7 @@ def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROU
     """
     if lgb is None:
         raise RuntimeError("lightgbm is required to train the post-processor")
-    X = build_features(pairs)
+    X = build_features(pairs, feature_list(feature_groups) if feature_groups is not None else None)
     y = pd.to_numeric(pairs["obs_snowfall_in"], errors="coerce")
     dset = lgb.Dataset(X, label=y, categorical_feature=CATEGORICAL_FEATURES,
                        free_raw_data=False)
@@ -241,7 +304,14 @@ def predict(boosters: dict, pairs: pd.DataFrame, *, calib: Optional[dict] = None
     without it (or with pre-v1.6 saved models) the legacy 1in hurdle applies,
     so old model dirs keep producing exactly what they used to.
     """
-    X = build_features(pairs)
+    # Feature list comes from the boosters themselves (LightGBM stores it):
+    # a model trained on an ablated / older feature set predicts correctly
+    # regardless of what this module's FEATURES currently says.
+    try:
+        feats = next(iter(boosters.values())).feature_name()
+    except AttributeError:   # test fakes / stubs without feature_name()
+        feats = None
+    X = build_features(pairs, feats if feats else None)
     raw = {name: bst.predict(X) for name, bst in boosters.items()}
     out = pd.DataFrame(index=pairs.index)
 

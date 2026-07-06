@@ -24,6 +24,18 @@ from .snowphysics import wet_bulb_c
 
 PHASE_COLS = ["wb_mean_c", "wb_min_c", "hours_wb_below_0", "freezing_level_m"]
 
+# Storm gate for phase features, shared by BOTH sides: live (fetch
+# fetch_phase_hourly only when consensus precip clears it) and training
+# (build_training_data NaN-masks phase columns on rows below it, mirroring
+# what inference will actually see). One constant, two call sites — a gate
+# that drifts apart is train/serve skew.
+PHASE_GATE_PRECIP_MM = 1.0
+
+
+def storm_gate(mm_precip_mean_mm) -> "pd.Series":
+    p = pd.to_numeric(pd.Series(mm_precip_mean_mm), errors="coerce")
+    return p >= PHASE_GATE_PRECIP_MM
+
 
 def daily_phase_aggregates(
     t_c, rh_pct, freezing_level_m=None,

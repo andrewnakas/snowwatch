@@ -232,6 +232,7 @@ def _member_nbm_snow17(
 def _member_postproc_snowfall(
     last_depth: float, last_swe: Optional[float], mm_fcst: pd.DataFrame,
     station: dict, hist_qc: pd.DataFrame, *, today: date, horizon: int,
+    ens_fcst: Optional[pd.DataFrame] = None,
 ) -> tuple[List[float], List[dict]]:
     """Pooled LightGBM post-processed snowfall accumulated onto the pack with
     the same degree-day melt as nbm_snowfall (v1.5); v1.6 adds the calibrated
@@ -251,7 +252,7 @@ def _member_postproc_snowfall(
     statics = _targets.station_statics(station, hist_qc)
     feats = _postproc.build_inference_features(
         mm_fcst, statics=statics, last_depth=last_depth, last_swe=last_swe,
-        issue_date=today, horizon=horizon)
+        issue_date=today, horizon=horizon, ens_fcst=ens_fcst)
     if feats.empty:
         return [], []
     preds = _postproc.predict(boosters, feats, calib=_postproc.load_calib())
@@ -1023,7 +1024,8 @@ def forecast_station(
         members_raw["nbm_snowfall"] = nbm_pred
 
     pp_pred, pp_daily = _member_postproc_snowfall(
-        last_depth, last_swe, mm_fcst, station, hist_qc, today=today, horizon=horizon)
+        last_depth, last_swe, mm_fcst, station, hist_qc, today=today,
+        horizon=horizon, ens_fcst=ens_fcst)
     if pp_pred:
         members_raw["postproc_snowfall"] = pp_pred
 

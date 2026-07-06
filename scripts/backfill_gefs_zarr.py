@@ -64,13 +64,28 @@ OUT_COLS = ["valid_date", "lead_days", "ens_snow_mean_cm", "ens_snow_std_cm",
             "ens_n_members", "z500_mean_m"]
 
 
+# Inits per transfer batch: a whole month at 31 members × 57 leads ×
+# 4·n_station points × 3 vars is ~2.5 GB raw and OOM-killed the first run
+# (2026-07-06, concurrent with the LightGBM retrain). 6 inits ≈ 450 MB peak.
+INIT_BATCH = 6
+
+
 def extract_month(ds, ym: str, stations: list[dict], *, today: date) -> pd.DataFrame:
-    import xarray as xr
     inits = [d for d in _month_days(ym) if d < today]
-    init_ts = pd.to_datetime([d.isoformat() for d in inits])
-    init_ts = init_ts[init_ts.isin(pd.to_datetime(ds.init_time.values))]
-    if len(init_ts) == 0:
+    init_all = pd.to_datetime([d.isoformat() for d in inits])
+    init_all = init_all[init_all.isin(pd.to_datetime(ds.init_time.values))]
+    if len(init_all) == 0:
         return pd.DataFrame(columns=["triplet", *OUT_COLS])
+    frames = [_extract_inits(ds, init_all[i:i + INIT_BATCH], stations)
+              for i in range(0, len(init_all), INIT_BATCH)]
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame(columns=["triplet", *OUT_COLS])
+    return pd.concat(frames, ignore_index=True)
+
+
+def _extract_inits(ds, init_ts, stations: list[dict]) -> pd.DataFrame:
+    import xarray as xr
 
     lats = np.array([s["lat"] for s in stations], dtype=float)
     lons = np.array([s["lon"] for s in stations], dtype=float)

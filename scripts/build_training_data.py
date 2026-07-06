@@ -43,6 +43,32 @@ _spec.loader.exec_module(bf)
 MODEL_KEYS = ("nbm", "hrrr", "gfs", "ifs", "aifs")
 SNOW_MODELS = ("nbm", "hrrr", "gfs")  # models with archived snowfall
 
+# v1.6 Phase-3 feature trees (all keyed on (valid_date, lead_days), same
+# headerless-gzip layout as the model trees; left-merged, NaN where absent):
+#   gefs_ens   — GEFS 31-member spread stats + z500 (backfill_gefs_zarr.py)
+#   hrrr_zarr  — HRRR NATIVE snowfall, lead 1 (backfill_hrrr_zarr.py);
+#                a different quantity than hrrr_snowfall_cm (0.7 cm/mm
+#                convention), hence its own column
+#   gfs_phase  — GFS wet-bulb aggregates (backfill_gfs_phase_zarr.py),
+#                storm-gate-masked below to mirror the live fetch gate
+GEFS_ENS_COLS = ["ens_snow_mean_cm", "ens_snow_std_cm", "ens_snow_p10_cm",
+                 "ens_snow_p50_cm", "ens_snow_p90_cm", "ens_prob_pos",
+                 "ens_precip_mean_mm", "ens_precip_std_mm", "ens_n_members",
+                 "z500_mean_m"]
+GFS_PHASE_COLS = ["wb_mean_c", "wb_min_c", "hours_wb_below_0"]
+
+
+def _read_aux_tree(tree: str, triplet: str, cols: list[str]) -> pd.DataFrame:
+    p = (Path(__file__).resolve().parents[1] / "data" / "prevruns" / tree
+         / f"{triplet.replace(':', '_')}.csv.gz")
+    if not p.exists():
+        return pd.DataFrame(columns=["valid_date", "lead_days", *cols])
+    df = pd.read_csv(p, names=["valid_date", "lead_days", *cols], compression="gzip")
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["lead_days"] = pd.to_numeric(df["lead_days"], errors="coerce").astype("Int64")
+    return df.drop_duplicates(subset=["valid_date", "lead_days"], keep="last")
+
 
 # SNOTEL obs history window. The Zarr GFS/HRRR/GEFS backfill reaches winter
 # 2021-22, so the obs pull must too — AWDB is free, the constraint is only
@@ -83,6 +109,26 @@ def build_station(st: dict, *, hist_days: int = HIST_DAYS) -> pd.DataFrame | Non
         fc["mm_precip_mean_mm"] = fc[precip_cols].mean(axis=1)
         fc["mm_precip_std_mm"] = fc[precip_cols].std(axis=1)
         fc["mm_n"] = fc[precip_cols].notna().sum(axis=1)
+
+    # Phase-3 aux trees (left merges; all-NaN when the tree hasn't landed).
+    ens = _read_aux_tree("gefs_ens", triplet, GEFS_ENS_COLS)
+    if not ens.empty:
+        fc = fc.merge(ens, on=["valid_date", "lead_days"], how="left")
+    hz = _read_aux_tree("hrrr_zarr", triplet,
+                        ["hrrr_native_snowfall_cm", "hrrr_native_precip_mm",
+                         "hrrr_native_tmean_c"])
+    if not hz.empty:
+        fc = fc.merge(hz[["valid_date", "lead_days", "hrrr_native_snowfall_cm"]],
+                      on=["valid_date", "lead_days"], how="left")
+    ph = _read_aux_tree("gfs_phase", triplet, GFS_PHASE_COLS)
+    if not ph.empty:
+        fc = fc.merge(ph, on=["valid_date", "lead_days"], how="left")
+        # Gate mirror: live inference only fetches phase vars when consensus
+        # precip clears the storm gate — training rows below it must not
+        # carry the features, or the model learns a signal it won't get.
+        from app.phase_features import storm_gate
+        gated_off = ~storm_gate(fc.get("mm_precip_mean_mm")).to_numpy()
+        fc.loc[gated_off, GFS_PHASE_COLS] = np.nan
 
     # Targets: QC'd daily snowfall + antecedent state.
     end = date.today()

@@ -58,3 +58,17 @@ class TestPhaseFrame:
     def test_empty(self):
         out = PF.phase_frame_from_hourly(pd.DataFrame())
         assert out.empty
+
+
+class TestVectorizedWetBulb:
+    def test_vec_matches_scalar(self):
+        # The Zarr backfill uses a vectorized Stull; it must stay in
+        # lockstep with snowphysics.wet_bulb_c (the live/scalar path).
+        from app.snowphysics import wet_bulb_c
+        from scripts.backfill_gfs_phase_zarr import _wb_vec
+        rng = np.random.default_rng(7)
+        t = rng.uniform(-25, 15, 200)
+        rh = rng.uniform(5, 100, 200)
+        vec = _wb_vec(t, rh)
+        scalar = np.array([wet_bulb_c(a, b) for a, b in zip(t, rh)])
+        assert np.allclose(vec, scalar, atol=1e-9)
