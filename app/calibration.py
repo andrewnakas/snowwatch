@@ -88,22 +88,23 @@ def tune_gate(prob_cal, y_true, lead_days, *, threshold_in: float,
     if fb_band is None:
         fb_band = fb_band_for(threshold_in)
     if candidates is None:
-        candidates = np.round(np.arange(0.05, 0.96, 0.05), 2)
+        # 0.01 steps: at rare thresholds/long leads the FB band is crossed
+        # in a narrow probability window — a 0.05 grid jumps straight over
+        # it (observed 2026-07-06: no valid 6in gate at leads 3-7, CSI@6
+        # 0.197→0.104) — and a missing gate costs far more than a slightly
+        # off-optimum one.
+        candidates = np.round(np.arange(0.02, 0.97, 0.01), 2)
     df = pd.DataFrame({
         "p": np.asarray(prob_cal, dtype=float),
         "y": np.asarray(y_true, dtype=float),
         "bucket": [lead_bucket(int(ld)) for ld in np.asarray(lead_days)],
     }).dropna()
-    out = {}
-    for (lo, hi) in LEAD_BUCKETS:
-        b = f"{lo}-{hi}"
-        sub = df[df["bucket"] == b]
+    def _best_gate(sub: pd.DataFrame) -> dict:
         n_events = int((sub["y"] >= threshold_in).sum())
         best = {"gate": None, "csi": None, "pod": None, "far": None,
                 "freq_bias": None, "n_events": n_events}
         if n_events == 0:
-            out[b] = best
-            continue
+            return best
         for g in candidates:
             pred = np.where(sub["p"].to_numpy() >= g, threshold_in, 0.0)
             c = csi_pod_far(sub["y"], pred, threshold_in=threshold_in)
@@ -115,5 +116,21 @@ def tune_gate(prob_cal, y_true, lead_days, *, threshold_in: float,
                 best = {"gate": float(g), "csi": c["csi"], "pod": c["pod"],
                         "far": c["far"], "freq_bias": c["freq_bias"],
                         "n_events": n_events}
+        return best
+
+    out = {}
+    pooled = None
+    for (lo, hi) in LEAD_BUCKETS:
+        b = f"{lo}-{hi}"
+        best = _best_gate(df[df["bucket"] == b])
+        if best["gate"] is None:
+            # Lead-pooled fallback: 3x the events, averages lead-dependent
+            # bias. A slightly mistuned gate beats no gate — without one the
+            # cascade simply cannot call events at this threshold/lead.
+            if pooled is None:
+                pooled = _best_gate(df)
+            if pooled["gate"] is not None:
+                best = dict(pooled, pooled_fallback=True,
+                            n_events=best["n_events"])
         out[b] = best
     return out

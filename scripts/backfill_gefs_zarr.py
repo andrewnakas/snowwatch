@@ -180,7 +180,19 @@ def main() -> int:
             ym = nxt
             continue
         t1 = time.time()
-        month_df = extract_month(ds, ym, stations, today=today)
+        month_df = None
+        for attempt in range(4):
+            try:
+                month_df = extract_month(ds, ym, stations, today=today)
+                break
+            except Exception as exc:   # transient S3/http resets kill hours
+                print(f"{ym}: attempt {attempt+1} failed "
+                      f"({type(exc).__name__}: {str(exc)[:120]})", flush=True)
+                time.sleep(30 * (attempt + 1))
+        if month_df is None:
+            print(f"{ym}: giving up after 4 attempts — rerun later")
+            ym = nxt
+            continue
         n = 0
         for triplet, g in month_df.groupby("triplet"):
             p = OUT_ROOT / f"{str(triplet).replace(':', '_')}.csv.gz"

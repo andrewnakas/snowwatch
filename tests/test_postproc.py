@@ -76,6 +76,23 @@ class TestBuildInferenceFeatures:
         assert feats.empty
 
 
+class TestGateTuning:
+    def test_lead_pooled_fallback(self):
+        # Events exist only at leads 1-2; buckets 3-4/5-7 have no events of
+        # their own and must inherit the pooled gate instead of None.
+        from app import calibration as C
+        rng = np.random.default_rng(9)
+        n = 3000
+        leads = rng.integers(1, 8, n)
+        p = rng.uniform(0, 1, n)
+        y = np.where((leads <= 2) & (p > 0.7), 6.5, 0.0)
+        gates = C.tune_gate(p, y, leads, threshold_in=6.0)
+        assert gates["1-2"]["gate"] is not None
+        for b in ("3-4", "5-7"):
+            assert gates[b]["gate"] is not None
+            assert gates[b].get("pooled_fallback") is True
+
+
 class TestPhaseGateMirror:
     def test_phase_cols_masked_below_gate(self):
         import pandas as pd
