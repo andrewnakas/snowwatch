@@ -110,6 +110,11 @@ jobs:
           SW_NO_FETCH: ${{ github.event.inputs.bootstrap == 'true' && '0' || '0' }}
           SW_ENABLE_CHRONOS: "1"
           SW_ENSEMBLE_BUILD: ${{ steps.ens.outputs.ensemble }}
+          # Armed, not active: the postproc member also requires trained
+          # models restored from the training-data Release, which only exist
+          # once scripts/release_model.py ships a build that passed the
+          # pre-registered fold gates + the train/serve skew gate.
+          SW_ENABLE_POSTPROC: "1"
         run: |
           python scripts/build_static_site.py \
             --shard-id ${{ matrix.shard }} \
