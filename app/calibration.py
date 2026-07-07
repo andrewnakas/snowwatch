@@ -78,15 +78,22 @@ def apply_isotonic(raw_prob, curve: Optional[dict]) -> np.ndarray:
 
 
 def tune_gate(prob_cal, y_true, lead_days, *, threshold_in: float,
+              amount_pred=None,
               fb_band: Optional[tuple[float, float]] = None,
               candidates: Optional[np.ndarray] = None) -> dict:
-    """Per-lead-bucket probability cutoffs maximizing CSI within the FB band.
+    """Per-lead-bucket probability cutoffs for the cascade floor.
 
-    Returns {bucket: {"gate": g, "csi": ..., "pod": ..., "far": ...,
-    "freq_bias": ..., "n_events": ...}}. A bucket with no admissible gate
-    (every candidate breaks the FB band, or no events to tune on) gets
-    gate=None — the cascade must then skip flooring at this threshold for
-    that bucket rather than fall back to an uncalibrated guess.
+    amount_pred: the Tweedie regressor's per-row output. The cascade predicts
+    an event when EITHER amount>=threshold OR the gate fires, so the gate is
+    tuned on the RESIDUAL — the realized contingency scored is
+    max(amount, gate_floor) >= threshold, not the gate alone. Without this,
+    the amount regressor's own event calls stack on top of a gate tuned to
+    FB≈1 and inflate realized FB (verified 2026-07-07: amount-alone FB 0.83@1
+    / 0.10@6, cascade 1.28 / 1.37). Passing amount_pred=None recovers the
+    gate-only behavior (legacy).
+
+    Returns {bucket: {"gate": g, "csi": ..., ...}}; gate=None where no
+    admissible gate exists (cascade then skips flooring for that bucket).
     """
     if fb_band is None:
         fb_band = fb_band_for(threshold_in)
@@ -97,11 +104,19 @@ def tune_gate(prob_cal, y_true, lead_days, *, threshold_in: float,
         # 0.197→0.104) — and a missing gate costs far more than a slightly
         # off-optimum one.
         candidates = np.round(np.arange(0.02, 0.97, 0.01), 2)
+    amount = (np.asarray(amount_pred, dtype=float) if amount_pred is not None
+              else np.zeros(len(np.asarray(prob_cal))))
     df = pd.DataFrame({
         "p": np.asarray(prob_cal, dtype=float),
         "y": np.asarray(y_true, dtype=float),
+        "amount": amount,
         "bucket": [lead_bucket(int(ld)) for ld in np.asarray(lead_days)],
     }).dropna()
+    def _cascade_pred(sub, gate):
+        """The production quantity: event iff amount>=thr OR p>=gate."""
+        return np.where((sub["amount"].to_numpy() >= threshold_in)
+                        | (sub["p"].to_numpy() >= gate), threshold_in, 0.0)
+
     def _best_gate(sub: pd.DataFrame) -> dict:
         n_events = int((sub["y"] >= threshold_in).sum())
         best = {"gate": None, "csi": None, "pod": None, "far": None,
@@ -109,35 +124,38 @@ def tune_gate(prob_cal, y_true, lead_days, *, threshold_in: float,
         if n_events == 0:
             return best
         p = sub["p"].to_numpy()
-        # Gate = the probability value at which the CUMULATIVE expected event
-        # count (sum of calibrated p) equals the count implied by a chosen
-        # frequency bias. With calibrated p, E[#events] = sum(p), so
-        # thresholding the top-sum(p) rows yields FB≈1 REGARDLESS of the
-        # slice's realized base rate — the objective uses only p, not the
-        # slice outcomes, so it transfers exactly across the calibration/test
-        # base-rate gap that broke CSI-max and FB-target-on-outcomes tuning
-        # (verified 2026-07-07: those gave FB 1.35 on a 0.097-base-rate tail
-        # realized on a 0.216 test winter). fb_target lets rare thresholds run
-        # slightly hot (miss ≫ false alarm operationally).
+        amt = sub["amount"].to_numpy()
+        # RESIDUAL expected-count gate. The cascade already calls an event
+        # wherever amount>=threshold; the gate must supply only the REMAINING
+        # events. With calibrated p, E[#events]=Σp, so among rows the amount
+        # regressor does NOT already flag, threshold the top-(target − already)
+        # by probability. Using only p (not slice outcomes) keeps it base-rate
+        # invariant; subtracting the amount calls keeps the cascade UNION at
+        # FB≈fb_target instead of stacking above it (verified 2026-07-07:
+        # gate-alone tuning let amount's own calls inflate cascade FB to
+        # 1.28@1 / 1.37@6). fb_target runs rare thresholds slightly hot
+        # (miss ≫ false alarm operationally).
         fb_target = 1.0 if threshold_in < RARE_THRESHOLD_IN else 1.15
-        target_events = float(np.sum(p)) * fb_target
-        order = np.sort(p)[::-1]
-        csum = np.cumsum(order)
-        k = int(np.searchsorted(csum, target_events))
-        k = min(max(k, 0), len(order) - 1)
-        gate = float(order[k]) if len(order) else 1.0
-        # Snap to the candidate grid for a stable, serializable value and read
-        # back the realized contingency stats on the slice.
+        already = amt >= threshold_in
+        target_total = float(np.sum(p)) * fb_target
+        residual_target = max(0.0, target_total - float(already.sum()))
+        # Rank only the not-already-flagged rows by probability.
+        p_resid = np.where(already, -np.inf, p)
+        order = np.sort(p_resid)[::-1]
+        order = order[np.isfinite(order)]
+        gate = 1.0
+        if residual_target >= 1 and len(order):
+            csum = np.cumsum(order)
+            k = min(int(np.searchsorted(csum, residual_target)), len(order) - 1)
+            gate = float(order[k])
         gate = float(min(candidates, key=lambda c: abs(c - gate)))
-        pred = np.where(p >= gate, threshold_in, 0.0)
-        c = csi_pod_far(sub["y"], pred, threshold_in=threshold_in)
-        # Guard: if the slice-realized FB lands outside the reporting band,
-        # fall back to the in-band gate closest to FB=1 (thin/odd slices).
+        c = csi_pod_far(sub["y"], _cascade_pred(sub, gate), threshold_in=threshold_in)
+        # Guard: if realized cascade FB lands outside the band, scan for the
+        # candidate whose cascade FB is closest to 1 within band.
         if c["freq_bias"] is None or not (fb_band[0] <= c["freq_bias"] <= fb_band[1]):
             cand = []
             for g in candidates:
-                cc = csi_pod_far(sub["y"], np.where(p >= g, threshold_in, 0.0),
-                                 threshold_in=threshold_in)
+                cc = csi_pod_far(sub["y"], _cascade_pred(sub, g), threshold_in=threshold_in)
                 if cc["freq_bias"] is not None and fb_band[0] <= cc["freq_bias"] <= fb_band[1]:
                     cand.append((abs(cc["freq_bias"] - 1.0), float(g), cc))
             if cand:

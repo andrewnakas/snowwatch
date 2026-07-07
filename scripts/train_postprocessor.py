@@ -86,6 +86,7 @@ def fit_calibration(boosters: dict, cal_df: pd.DataFrame) -> dict:
     raw_preds = postproc.predict(boosters, cal_df, calib=None)
     y = pd.to_numeric(cal_df["obs_snowfall_in"], errors="coerce").to_numpy()
     leads = pd.to_numeric(cal_df["lead_days"], errors="coerce").to_numpy()
+    amount = raw_preds["amount"].to_numpy()   # cascade's other event source
     iso: dict = {}
     gates: dict = {}
     for thr in postproc.EVENT_THRESHOLDS:
@@ -97,7 +98,8 @@ def fit_calibration(boosters: dict, cal_df: pd.DataFrame) -> dict:
         curve = calibration.fit_isotonic(p_raw, y >= thr)
         iso[key] = curve
         p_cal = calibration.apply_isotonic(p_raw, curve)
-        gates[key] = calibration.tune_gate(p_cal, y, leads, threshold_in=thr)
+        gates[key] = calibration.tune_gate(p_cal, y, leads, threshold_in=thr,
+                                           amount_pred=amount)
     return {"iso": iso, "gates": gates,
             "cal_rows": int(len(cal_df)),
             "cal_start": str(cal_df["valid_date"].min()),
