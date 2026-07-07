@@ -108,12 +108,9 @@ def evaluate_split(train_df: pd.DataFrame, test_df: pd.DataFrame, *,
                    label: str, n_boot: int = 1000,
                    cal_window: tuple[str, str] | None = None,
                    feature_groups: tuple[str, ...] | None = None) -> tuple[dict, dict, dict | None]:
-    """Train on train_df (minus a calibration slice), calibrate on the slice,
-    score on test_df. Returns (metrics, boosters, calib).
-
-    cal_window (start, end): season-matched calibration slice cut out of the
-    training period (boosters train around the hole). Default: the last
-    CAL_TAIL_DAYS of the training period."""
+    """Train on train_df minus a held-out calibration tail, fit isotonic +
+    FB-target gates on the tail, score on test_df. Returns (metrics, boosters,
+    calib). cal_window overrides the default tail slice when given."""
     print(f"\n=== {label}: train {len(train_df)} rows "
           f"(<= {train_df['valid_date'].max()}) / test {len(test_df)} rows "
           f"({test_df['valid_date'].min()} .. {test_df['valid_date'].max()}) ===")
@@ -121,10 +118,17 @@ def evaluate_split(train_df: pd.DataFrame, test_df: pd.DataFrame, *,
         cal_start, cal_end = cal_window
         in_cal = (train_df["valid_date"] >= cal_start) & (train_df["valid_date"] <= cal_end)
     else:
-        cal_start = (pd.to_datetime(train_df["valid_date"]).max()
-                     - pd.Timedelta(days=CAL_TAIL_DAYS)).strftime("%Y-%m-%d")
-        in_cal = train_df["valid_date"] >= cal_start
+        # Last CAL_TAIL_DAYS of training, held out of the booster fit. The
+        # slice's own base rate no longer drives realized FB because gates are
+        # tuned to FB≈1 on calibrated probs (calibration.tune_gate), which
+        # transfers across base rates — so the simplest out-of-sample slice is
+        # the right one. (Season-matched slices were tried and lost: in-sample
+        # inflated probs; out-of-sample-but-higher-base-rate under-fired.)
+        cutoff = (pd.to_datetime(train_df["valid_date"]).max()
+                  - pd.Timedelta(days=CAL_TAIL_DAYS)).strftime("%Y-%m-%d")
+        in_cal = train_df["valid_date"] >= cutoff
     inner_df = train_df[~in_cal]
+    cal_start = str(train_df.loc[in_cal, "valid_date"].min()) if in_cal.any() else None
     cal_df = train_df[in_cal]
     if inner_df.empty or len(cal_df) < 500:
         inner_df, cal_df = train_df, train_df.iloc[0:0]

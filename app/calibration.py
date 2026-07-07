@@ -32,18 +32,12 @@ FB_BAND = (0.8, 1.3)
 FB_BAND_RARE = (0.8, 1.5)
 RARE_THRESHOLD_IN = 6.0
 
-# Gates are TUNED against a band shrunk toward center: FB drifts between the
-# calibration slice and the verification season (observed 2026-07-06: gates
-# tuned to FB<=1.3 on the Oct-Nov tail realized FB 1.55 in Dec-Feb). Aiming
-# at the center keeps realized FB inside the pre-registered reporting band
-# [0.8, 1.3] ([0.8, 1.5] rare), which is what W2 is judged against.
-FB_TUNE_BAND = (0.85, 1.15)
-FB_TUNE_BAND_RARE = (0.85, 1.3)
-
-
+# Tuning band = the pre-registered reporting band. tune_gate targets FB≈1
+# WITHIN it (not the edge), so realized FB lands near 1 and comfortably
+# inside the band regardless of the calibration slice's base rate — no inward
+# margin needed once the objective is FB-target rather than CSI-max.
 def fb_band_for(threshold_in: float) -> tuple[float, float]:
-    """Tuning band (aim-center). Reporting band stays FB_BAND/FB_BAND_RARE."""
-    return FB_TUNE_BAND_RARE if threshold_in >= RARE_THRESHOLD_IN else FB_TUNE_BAND
+    return FB_BAND_RARE if threshold_in >= RARE_THRESHOLD_IN else FB_BAND
 
 
 def lead_bucket(lead_days: int) -> str:
@@ -114,17 +108,45 @@ def tune_gate(prob_cal, y_true, lead_days, *, threshold_in: float,
                 "freq_bias": None, "n_events": n_events}
         if n_events == 0:
             return best
-        for g in candidates:
-            pred = np.where(sub["p"].to_numpy() >= g, threshold_in, 0.0)
-            c = csi_pod_far(sub["y"], pred, threshold_in=threshold_in)
-            if c["csi"] is None or c["freq_bias"] is None:
-                continue
-            if not (fb_band[0] <= c["freq_bias"] <= fb_band[1]):
-                continue
-            if best["csi"] is None or c["csi"] > best["csi"]:
-                best = {"gate": float(g), "csi": c["csi"], "pod": c["pod"],
-                        "far": c["far"], "freq_bias": c["freq_bias"],
-                        "n_events": n_events}
+        p = sub["p"].to_numpy()
+        # Gate = the probability value at which the CUMULATIVE expected event
+        # count (sum of calibrated p) equals the count implied by a chosen
+        # frequency bias. With calibrated p, E[#events] = sum(p), so
+        # thresholding the top-sum(p) rows yields FB≈1 REGARDLESS of the
+        # slice's realized base rate — the objective uses only p, not the
+        # slice outcomes, so it transfers exactly across the calibration/test
+        # base-rate gap that broke CSI-max and FB-target-on-outcomes tuning
+        # (verified 2026-07-07: those gave FB 1.35 on a 0.097-base-rate tail
+        # realized on a 0.216 test winter). fb_target lets rare thresholds run
+        # slightly hot (miss ≫ false alarm operationally).
+        fb_target = 1.0 if threshold_in < RARE_THRESHOLD_IN else 1.15
+        target_events = float(np.sum(p)) * fb_target
+        order = np.sort(p)[::-1]
+        csum = np.cumsum(order)
+        k = int(np.searchsorted(csum, target_events))
+        k = min(max(k, 0), len(order) - 1)
+        gate = float(order[k]) if len(order) else 1.0
+        # Snap to the candidate grid for a stable, serializable value and read
+        # back the realized contingency stats on the slice.
+        gate = float(min(candidates, key=lambda c: abs(c - gate)))
+        pred = np.where(p >= gate, threshold_in, 0.0)
+        c = csi_pod_far(sub["y"], pred, threshold_in=threshold_in)
+        # Guard: if the slice-realized FB lands outside the reporting band,
+        # fall back to the in-band gate closest to FB=1 (thin/odd slices).
+        if c["freq_bias"] is None or not (fb_band[0] <= c["freq_bias"] <= fb_band[1]):
+            cand = []
+            for g in candidates:
+                cc = csi_pod_far(sub["y"], np.where(p >= g, threshold_in, 0.0),
+                                 threshold_in=threshold_in)
+                if cc["freq_bias"] is not None and fb_band[0] <= cc["freq_bias"] <= fb_band[1]:
+                    cand.append((abs(cc["freq_bias"] - 1.0), float(g), cc))
+            if cand:
+                cand.sort()
+                gate, c = cand[0][1], cand[0][2]
+            else:
+                return best
+        best = {"gate": gate, "csi": c["csi"], "pod": c["pod"],
+                "far": c["far"], "freq_bias": c["freq_bias"], "n_events": n_events}
         return best
 
     out = {}
