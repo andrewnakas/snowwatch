@@ -331,13 +331,26 @@ def main() -> int:
         train_df = pairs[pairs["valid_date"] < f["train_end"]]
         test_df = pairs[(pairs["valid_date"] >= f["test_start"])
                         & (pairs["valid_date"] <= f["test_end"])]
+        out_path = args.out / "metrics_ablation.json"
+        args.out.mkdir(parents=True, exist_ok=True)
+        # Resume-safe: reload any variants already computed (machine crashes
+        # mid-ablation have been frequent this session) and skip them.
         results = {}
+        if out_path.exists():
+            try:
+                results = json.loads(out_path.read_text())
+                if results:
+                    print(f"resuming ablation; already have: {sorted(results)}")
+            except json.JSONDecodeError:
+                results = {}
         variants: list[tuple[str, tuple[str, ...] | None]] = [
             ("base", tuple()),
             *[(f"+{g}", (g,)) for g in postproc.FEATURE_GROUPS],
             ("all", None),
         ]
         for name, gset in variants:
+            if name in results:
+                continue
             m, _, _ = evaluate_split(train_df, test_df,
                                      label=f"ablate:{name}", n_boot=300,
                                      feature_groups=gset)
@@ -345,9 +358,9 @@ def main() -> int:
                              ("mae", "bias", "csi_1in", "csi_2in", "csi_6in",
                               "csi_12in", "pod_6in", "fb_6in")}
             results[name]["crps"] = m.get("crps_postproc")
-        out_path = args.out / "metrics_ablation.json"
-        args.out.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(results, indent=2, default=float))
+            # Checkpoint after each variant so a crash loses at most one.
+            out_path.write_text(json.dumps(results, indent=2, default=float))
+            print(f"  checkpointed {name} -> {out_path}")
         print(f"\nwrote ablation table -> {out_path}")
         return 0
 
