@@ -87,13 +87,22 @@ def main() -> int:
                     help="skip the skew gate, recording REASON")
     ap.add_argument("--skip-train", action="store_true",
                     help="package the models already in data/models")
+    ap.add_argument("--rare-calib", default=None,
+                    help="dir holding rare_calib.json (rare-threshold "
+                         "overrides) REGENERATED AT THIS CUTOFF via "
+                         "build_oof_preds.py --fold production + "
+                         "rare_tail_lab.py --recipe-v2 — never reuse a "
+                         "fold's file whose OOF pool crosses the cutoff")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     if not args.skip_train:
         cutoff = args.cutoff or str(date.today().replace(day=1))
-        r = run([sys.executable, "scripts/train_postprocessor.py",
-                 "--cutoff", cutoff, "--feature-groups", args.feature_groups])
+        cmd = [sys.executable, "scripts/train_postprocessor.py",
+               "--cutoff", cutoff, "--feature-groups", args.feature_groups]
+        if args.rare_calib:
+            cmd += ["--rare-calib", args.rare_calib]
+        r = run(cmd)
         if r.returncode != 0:
             print("TRAIN failed")
             return 1
@@ -119,6 +128,7 @@ def main() -> int:
     notes = {
         "released": date.today().isoformat(),
         "feature_groups": args.feature_groups,
+        "rare_calib": args.rare_calib,
         "gates": msgs,
         "skew": skew_note,
         "meta": json.loads((MODELS_DIR / "postproc_meta.json").read_text())

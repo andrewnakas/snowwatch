@@ -62,16 +62,20 @@ def load_caches(oof_dir: Path) -> dict:
     oof["winter"] = np.where(d.dt.month <= 6,
                              (d.dt.year - 1).astype(str) + "-" + (d.dt.year % 100).map("{:02d}".format),
                              d.dt.year.astype(str) + "-" + ((d.dt.year + 1) % 100).map("{:02d}".format))
+    test_path = oof_dir / "final_test.parquet"
     out = {
         "oof": oof,
         "winters": [p.stem.replace("oof_", "") for p in oof_files],
-        "test": pd.read_parquet(oof_dir / "final_test.parquet"),
+        # production dirs have no test slice — only --recipe-v2 runs there
+        "test": pd.read_parquet(test_path) if test_path.exists() else None,
         "caltail_final": pd.read_parquet(oof_dir / "final_caltail.parquet"),
         "caltail_oof": {p.stem.replace("caltail_oof_", ""): pd.read_parquet(p)
                         for p in sorted(oof_dir.glob("caltail_oof_*.parquet"))},
     }
     for name in ("oof", "test", "caltail_final"):
         df = out[name]
+        if df is None:
+            continue
         df["obs_snowfall_in"] = pd.to_numeric(df["obs_snowfall_in"], errors="coerce")
         df["lead_days"] = pd.to_numeric(df["lead_days"], errors="coerce").astype(int)
         df["nbm_in"] = pd.to_numeric(df["nbm_snowfall_cm"], errors="coerce") * CM_TO_IN

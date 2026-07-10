@@ -89,7 +89,13 @@ def core_winters(train_df: pd.DataFrame, train_end: str) -> list[tuple[str, str,
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pairs", type=Path, default=ROOT / "data" / "training" / "pairs.csv.gz")
-    ap.add_argument("--fold", default="A_core_winter", choices=sorted(FOLDS))
+    ap.add_argument("--fold", default="A_core_winter",
+                    choices=sorted(FOLDS) + ["production"])
+    ap.add_argument("--train-end", default=None,
+                    help="required with --fold production: the production "
+                         "training cutoff. No test slice is dumped — the "
+                         "caches exist to tune rare_calib.json for the "
+                         "release build (rare_tail_lab.py --recipe-v2)")
     ap.add_argument("--feature-groups", default="ens,phase",
                     help="comma-separated Phase-3 groups ('none' = base only)")
     ap.add_argument("--out", type=Path, default=ROOT / "data" / "training" / "oof")
@@ -99,7 +105,13 @@ def main() -> int:
               else tuple(g.strip() for g in args.feature_groups.split(",")))
     fset = "+".join(groups) if groups else "base"
     out_dir = args.out / fset / args.fold
-    fold = FOLDS[args.fold]
+    if args.fold == "production":
+        if not args.train_end:
+            ap.error("--fold production requires --train-end")
+        fold = {"train_end": args.train_end,
+                "test_start": args.train_end, "test_end": args.train_end}
+    else:
+        fold = FOLDS[args.fold]
 
     pairs = pd.read_csv(args.pairs, compression="gzip")
     pairs = postproc.usable_rows(pairs)
@@ -130,10 +142,10 @@ def main() -> int:
             (inner_df[in_w], out_dir / f"oof_{label}.parquet"),
             (cal_df, out_dir / f"caltail_oof_{label}.parquet"),
         ]))
-    jobs.append(("final", inner_df, [
-        (cal_df, out_dir / "final_caltail.parquet"),
-        (test_df, out_dir / "final_test.parquet"),
-    ]))
+    final_targets = [(cal_df, out_dir / "final_caltail.parquet")]
+    if not test_df.empty:
+        final_targets.append((test_df, out_dir / "final_test.parquet"))
+    jobs.append(("final", inner_df, final_targets))
 
     for name, fit_df, targets in jobs:
         if all(p.exists() for _, p in targets):
