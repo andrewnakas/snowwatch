@@ -80,6 +80,7 @@ def apply_isotonic(raw_prob, curve: Optional[dict]) -> np.ndarray:
 def tune_gate(prob_cal, y_true, lead_days, *, threshold_in: float,
               amount_pred=None,
               fb_band: Optional[tuple[float, float]] = None,
+              fb_target: Optional[float] = None,
               candidates: Optional[np.ndarray] = None) -> dict:
     """Per-lead-bucket probability cutoffs for the cascade floor.
 
@@ -134,10 +135,12 @@ def tune_gate(prob_cal, y_true, lead_days, *, threshold_in: float,
         # FB≈fb_target instead of stacking above it (verified 2026-07-07:
         # gate-alone tuning let amount's own calls inflate cascade FB to
         # 1.28@1 / 1.37@6). fb_target runs rare thresholds slightly hot
-        # (miss ≫ false alarm operationally).
-        fb_target = 1.0 if threshold_in < RARE_THRESHOLD_IN else 1.15
+        # (miss ≫ false alarm operationally); callers with a season-matched
+        # calibration set (rare_tail_lab) sweep it instead.
+        target = (fb_target if fb_target is not None
+                  else 1.0 if threshold_in < RARE_THRESHOLD_IN else 1.15)
         already = amt >= threshold_in
-        target_total = float(np.sum(p)) * fb_target
+        target_total = float(np.sum(p)) * target
         residual_target = max(0.0, target_total - float(already.sum()))
         # Rank only the not-already-flagged rows by probability.
         p_resid = np.where(already, -np.inf, p)
@@ -151,13 +154,13 @@ def tune_gate(prob_cal, y_true, lead_days, *, threshold_in: float,
         gate = float(min(candidates, key=lambda c: abs(c - gate)))
         c = csi_pod_far(sub["y"], _cascade_pred(sub, gate), threshold_in=threshold_in)
         # Guard: if realized cascade FB lands outside the band, scan for the
-        # candidate whose cascade FB is closest to 1 within band.
+        # candidate whose cascade FB is closest to the target within band.
         if c["freq_bias"] is None or not (fb_band[0] <= c["freq_bias"] <= fb_band[1]):
             cand = []
             for g in candidates:
                 cc = csi_pod_far(sub["y"], _cascade_pred(sub, g), threshold_in=threshold_in)
                 if cc["freq_bias"] is not None and fb_band[0] <= cc["freq_bias"] <= fb_band[1]:
-                    cand.append((abs(cc["freq_bias"] - 1.0), float(g), cc))
+                    cand.append((abs(cc["freq_bias"] - target), float(g), cc))
             if cand:
                 cand.sort()
                 gate, c = cand[0][1], cand[0][2]

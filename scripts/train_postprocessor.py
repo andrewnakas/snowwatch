@@ -69,6 +69,12 @@ FOLDS = {
                       "test_start": "2025-12-01", "test_end": "2026-02-28"},
     "B_spring": {"train_end": "2026-02-28",
                  "test_start": "2026-02-28", "test_end": None},
+    # Second full-winter confirmation fold for the rare-tail work: same
+    # season shape as fold A but a different test winter, so a recipe tuned
+    # on OOF prior winters has to generalize twice. Its OOF calibration set
+    # may only use winters inside ITS train region (<= 2023-24).
+    "C_prior_winter": {"train_end": "2024-11-30",
+                       "test_start": "2024-12-01", "test_end": "2025-02-28"},
 }
 
 
@@ -76,12 +82,21 @@ def _fmt(v, spec="0.3f"):
     return format(v, spec) if v is not None else "n/a"
 
 
-def fit_calibration(boosters: dict, cal_df: pd.DataFrame) -> dict:
+def fit_calibration(boosters: dict, cal_df: pd.DataFrame,
+                    rare_overrides: dict | None = None) -> dict:
     """Isotonic curves + tuned gates from the calibration tail.
 
     Curves are fit on the monotone UNcalibrated probabilities that predict()
     emits without a calib payload — the same transform inference applies
     before the curves, so fit and apply see identical inputs.
+
+    rare_overrides (scripts/rare_tail_lab.py output, rare_calib.json):
+    per-threshold iso/gates (+ optional qfloor) fit on OOF prior-winter
+    predictions instead of the 60d tail. The tail has ~zero >=12in events,
+    so without this the 12in head runs uncalibrated and mostly ungated —
+    the cascade cannot call 12in events at most leads. Overridden
+    thresholds simply replace the tail-fit entries; the payload shape
+    predict() reads is unchanged.
     """
     raw_preds = postproc.predict(boosters, cal_df, calib=None)
     y = pd.to_numeric(cal_df["obs_snowfall_in"], errors="coerce").to_numpy()
@@ -100,19 +115,35 @@ def fit_calibration(boosters: dict, cal_df: pd.DataFrame) -> dict:
         p_cal = calibration.apply_isotonic(p_raw, curve)
         gates[key] = calibration.tune_gate(p_cal, y, leads, threshold_in=thr,
                                            amount_pred=amount)
-    return {"iso": iso, "gates": gates,
-            "cal_rows": int(len(cal_df)),
-            "cal_start": str(cal_df["valid_date"].min()),
-            "cal_end": str(cal_df["valid_date"].max())}
+    calib = {"iso": iso, "gates": gates,
+             "cal_rows": int(len(cal_df)),
+             "cal_start": str(cal_df["valid_date"].min()),
+             "cal_end": str(cal_df["valid_date"].max())}
+    if rare_overrides:
+        for key, curve in (rare_overrides.get("iso") or {}).items():
+            iso[key] = curve
+        for key, g in (rare_overrides.get("gates") or {}).items():
+            gates[key] = g
+        if rare_overrides.get("qfloor"):
+            calib["qfloor"] = rare_overrides["qfloor"]
+        calib["rare_cal"] = rare_overrides.get("provenance", {})
+        print(f"  rare overrides applied: iso {sorted((rare_overrides.get('iso') or {}))} "
+              f"gates {sorted((rare_overrides.get('gates') or {}))} "
+              f"qfloor {calib.get('qfloor')}")
+    return calib
 
 
 def evaluate_split(train_df: pd.DataFrame, test_df: pd.DataFrame, *,
                    label: str, n_boot: int = 1000,
                    cal_window: tuple[str, str] | None = None,
-                   feature_groups: tuple[str, ...] | None = None) -> tuple[dict, dict, dict | None]:
+                   feature_groups: tuple[str, ...] | None = None,
+                   rare_overrides: dict | None = None,
+                   dump_dir: Path | None = None) -> tuple[dict, dict, dict | None]:
     """Train on train_df minus a held-out calibration tail, fit isotonic +
     FB-target gates on the tail, score on test_df. Returns (metrics, boosters,
-    calib). cal_window overrides the default tail slice when given."""
+    calib). cal_window overrides the default tail slice when given.
+    dump_dir caches raw head outputs (cal tail + test) as parquet for the
+    decision-layer lab; rare_overrides is the lab's rare_calib.json payload."""
     print(f"\n=== {label}: train {len(train_df)} rows "
           f"(<= {train_df['valid_date'].max()}) / test {len(test_df)} rows "
           f"({test_df['valid_date'].min()} .. {test_df['valid_date'].max()}) ===")
@@ -137,12 +168,16 @@ def evaluate_split(train_df: pd.DataFrame, test_df: pd.DataFrame, *,
     boosters = postproc.train(inner_df, feature_groups=feature_groups)
     calib = None
     if not cal_df.empty and any(k.startswith("exc_") for k in boosters):
-        calib = fit_calibration(boosters, cal_df)
+        calib = fit_calibration(boosters, cal_df, rare_overrides=rare_overrides)
         for thr_key, by_bucket in calib["gates"].items():
             desc = " ".join(
                 f"{b}:{(g['gate'] if g['gate'] is not None else '-')}"
                 for b, g in by_bucket.items())
             print(f"  gates @{thr_key}in  {desc}")
+    if dump_dir is not None:
+        postproc.dump_predictions(boosters, cal_df, dump_dir / "final_caltail.parquet")
+        postproc.dump_predictions(boosters, test_df, dump_dir / "final_test.parquet")
+        print(f"  dumped cal-tail + test prediction caches -> {dump_dir}")
     preds = postproc.predict(boosters, test_df, calib=calib)
 
     ev = test_df.copy()
@@ -277,7 +312,9 @@ def evaluate_split(train_df: pd.DataFrame, test_df: pd.DataFrame, *,
             print(f"postproc vs NBM: ΔMAE={bb['diff']:+.3f} in "
                   f"[{bb['ci_lo']:+.3f}, {bb['ci_hi']:+.3f}] "
                   f"P(better)={bb['p_a_better']:.2f} over {bb['n_blocks']} station-weeks")
-        for thr in (1.0, 6.0):
+        # All four operational thresholds: the rare-tail claims (6/12in) need
+        # CIs just as much as the headline 1in one.
+        for thr in (1.0, 2.0, 6.0, 12.0):
             def csi_delta(d, thr=thr):
                 a = verification.csi_pod_far(d["obs_snowfall_in"], d["postproc"],
                                              threshold_in=thr)["csi"]
@@ -312,6 +349,16 @@ def main() -> int:
                          "exists and passed check_feature_skew")
     ap.add_argument("--out", type=Path, default=postproc.MODELS_DIR)
     ap.add_argument("--no-save", action="store_true")
+    ap.add_argument("--dump-preds", type=Path, default=None,
+                    help="cache raw head outputs (cal tail + test) as parquet "
+                         "under DIR/<fold-or-label>/ for scripts/rare_tail_lab.py")
+    ap.add_argument("--rare-calib", type=Path, default=None,
+                    help="dir holding <fold>/rare_calib.json rare-threshold "
+                         "overrides built by scripts/rare_tail_lab.py from OOF "
+                         "prior-winter predictions. Ship-time note: regenerate "
+                         "the OOF set with the production train_end before a "
+                         "release; a fold's overrides must only use winters "
+                         "inside that fold's train region")
     args = ap.parse_args()
 
     pairs = pd.read_csv(args.pairs, compression="gzip")
@@ -376,8 +423,25 @@ def main() -> int:
                 continue
             cal_w = (f["cal_start"], f["cal_end"]) \
                 if f.get("cal_start") and f.get("cal_end") else None
-            m, _, _ = evaluate_split(train_df, test_df, label=name,
-                                     cal_window=cal_w, feature_groups=groups)
+            # Rare overrides are per fold: they may only use winters inside
+            # the fold's train region. B_spring alone may borrow fold A's
+            # (A's winters all predate B's train_end); C must NOT — fold A's
+            # OOF set contains winter 2024-25, which is C's test.
+            rare = None
+            if args.rare_calib:
+                lookup = [name] + (["A_core_winter"] if name == "B_spring" else [])
+                for cand in lookup:
+                    p = args.rare_calib / cand / "rare_calib.json"
+                    if p.exists():
+                        rare = json.loads(p.read_text())
+                        print(f"fold {name}: rare overrides from {p}")
+                        break
+                if rare is None:
+                    print(f"fold {name}: no rare_calib.json found, tail-only calibration")
+            m, _, _ = evaluate_split(
+                train_df, test_df, label=name, cal_window=cal_w,
+                feature_groups=groups, rare_overrides=rare,
+                dump_dir=(args.dump_preds / name) if args.dump_preds else None)
             m["fold"] = f
             results[name] = m
         out_path = args.out / "metrics_folds.json"
@@ -393,9 +457,21 @@ def main() -> int:
     if train_df.empty or test_df.empty:
         print("degenerate split — adjust --cutoff")
         return 1
-    metrics, boosters, calib = evaluate_split(train_df, test_df,
-                                              label=f"cutoff_{cutoff}",
-                                              feature_groups=groups)
+    rare = None
+    if args.rare_calib:
+        # Production-save path: expects overrides regenerated for THIS
+        # train_end (see --rare-calib help); a bare rare_calib.json in the
+        # dir is taken as exactly that.
+        p = args.rare_calib / "rare_calib.json"
+        if p.exists():
+            rare = json.loads(p.read_text())
+            print(f"rare overrides from {p}")
+        else:
+            print(f"no {p} — tail-only calibration")
+    metrics, boosters, calib = evaluate_split(
+        train_df, test_df, label=f"cutoff_{cutoff}", feature_groups=groups,
+        rare_overrides=rare,
+        dump_dir=(args.dump_preds / f"cutoff_{cutoff}") if args.dump_preds else None)
     metrics["cutoff"] = cutoff
 
     if not args.no_save:

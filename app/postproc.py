@@ -243,7 +243,8 @@ def _exc_key(thr: float) -> str:
 
 
 def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROUNDS,
-          feature_groups: Optional[Iterable[str]] = None) -> dict:
+          feature_groups: Optional[Iterable[str]] = None,
+          heads: Optional[set[str]] = None) -> dict:
     """Train quantile boosters + a Tweedie point booster (+ an L1 head for
     comparison). Returns {name: Booster} with `point` = the production model.
 
@@ -251,29 +252,43 @@ def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROU
     period — temporal splitting is the caller's job (see
     scripts/train_postprocessor.py), because honest evaluation needs the
     split to respect time, not random rows.
+
+    `heads` restricts which boosters get trained (names as returned: "amount",
+    "exc_6", "q90", "point_l1", ...). None trains everything. The OOF
+    rare-calibration loop (scripts/build_oof_preds.py) trains 5 sibling
+    models, so skipping the ~half of the ladder it never reads matters.
     """
     if lgb is None:
         raise RuntimeError("lightgbm is required to train the post-processor")
+
+    def want(name: str) -> bool:
+        return heads is None or name in heads
+
     X = build_features(pairs, feature_list(feature_groups) if feature_groups is not None else None)
     y = pd.to_numeric(pairs["obs_snowfall_in"], errors="coerce")
     dset = lgb.Dataset(X, label=y, categorical_feature=CATEGORICAL_FEATURES,
                        free_raw_data=False)
     out = {}
     for q in quantiles:
+        if not want(f"q{int(q * 100)}"):
+            continue
         params = dict(LGB_PARAMS, alpha=q)
         out[f"q{int(q * 100)}"] = lgb.train(params, dset, num_boost_round=num_rounds)
 
     # Amount head: Tweedie regressor (handles the zero-inflated tail).
-    tw_params = dict(LGB_PARAMS, objective="tweedie", metric="tweedie",
-                     tweedie_variance_power=TWEEDIE_VARIANCE_POWER)
-    tw_params.pop("alpha", None)
-    out["amount"] = lgb.train(tw_params, dset, num_boost_round=num_rounds)
+    if want("amount"):
+        tw_params = dict(LGB_PARAMS, objective="tweedie", metric="tweedie",
+                         tweedie_variance_power=TWEEDIE_VARIANCE_POWER)
+        tw_params.pop("alpha", None)
+        out["amount"] = lgb.train(tw_params, dset, num_boost_round=num_rounds)
 
     # Exceedance heads: P(snowfall >= T) per operational threshold. Each is
     # isotonic-calibrated downstream (app/calibration.py), so what matters
     # here is ranking quality on the rare positives — hence scale_pos_weight.
     # The 1in head doubles as the legacy `psnow` occurrence probability.
     for thr in EVENT_THRESHOLDS:
+        if not want(_exc_key(thr)):
+            continue
         clf_label = (y.to_numpy() >= thr).astype(int)
         pos = clf_label.sum()
         if pos == 0 or pos == clf_label.size:
@@ -289,9 +304,10 @@ def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROU
 
     # Diagnostic L1 head — kept so the scorecard can show the MAE-optimal
     # model's CSI collapse next to the hurdle model. Not used in production.
-    l1_params = dict(LGB_PARAMS, objective="l1", metric="l1")
-    l1_params.pop("alpha", None)
-    out["point_l1"] = lgb.train(l1_params, dset, num_boost_round=num_rounds)
+    if want("point_l1"):
+        l1_params = dict(LGB_PARAMS, objective="l1", metric="l1")
+        l1_params.pop("alpha", None)
+        out["point_l1"] = lgb.train(l1_params, dset, num_boost_round=num_rounds)
     return out
 
 
@@ -324,6 +340,16 @@ def predict(boosters: dict, pairs: pd.DataFrame, *, calib: Optional[dict] = None
     amount = np.maximum(0.0, raw.get("amount", raw.get("point", np.zeros(len(pairs)))))
     out["amount"] = amount
 
+    # Quantile members before the cascade: the qfloor rule below reads the
+    # clamped+sorted values, the same ones callers see.
+    for name in raw:
+        if name.startswith("q") and name[1:].isdigit():
+            out[name] = np.maximum(0.0, raw[name])
+    qcols = sorted((c for c in out.columns if c.startswith("q") and c[1:].isdigit()),
+                   key=lambda c: int(c[1:]))
+    if len(qcols) > 1:
+        out[qcols] = np.sort(out[qcols].to_numpy(), axis=1)
+
     present = [t for t in EVENT_THRESHOLDS if _exc_key(t) in raw]
     if present:
         # Monotone raw scores (P(>=T) can't rise with T), calibrate each,
@@ -354,6 +380,23 @@ def predict(boosters: dict, pairs: pd.DataFrame, *, calib: Optional[dict] = None
                         continue
                     hit = (buckets == b) & (cal[thr] >= g)
                     floor = np.where(hit, np.maximum(floor, thr), floor)
+            # Quantile-OR floor (rare-tail path): a high upper quantile
+            # clearing a tuned cut is an event call in its own right — the
+            # amount head regresses to the mean on the heavy tail
+            # (amount-alone FB 0.10@6in), but a p90/p95 head is trained to
+            # sit above all but the top tail of outcomes. Per lead bucket,
+            # because quantiles sharpen at short leads and one global cut
+            # over-fires there (measured: q80-rule FB@6 1.87 at leads 1-2
+            # vs 1.41 at 5-7). Payload: {"<thr>": {"<bucket>": ["q95",
+            # 15.6], ...}} — call >=thr where q95 >= 15.6 in that bucket.
+            # Head + cut are chosen on the OOF winters
+            # (scripts/rare_tail_lab.py); absent `qfloor`, nothing changes.
+            for thr_key, by_bucket in ((calib or {}).get("qfloor") or {}).items():
+                thr = float(thr_key)
+                for b, (qname, qcut) in (by_bucket or {}).items():
+                    if qname in out.columns:
+                        hit = (buckets == b) & (out[qname].to_numpy() >= float(qcut))
+                        floor = np.where(hit, np.maximum(floor, thr), floor)
         else:
             # No tuned gates yet (evaluation during calibration fitting, or a
             # calib-less deploy): fall back to the legacy 1in hurdle.
@@ -368,16 +411,32 @@ def predict(boosters: dict, pairs: pd.DataFrame, *, calib: Optional[dict] = None
     else:
         out["point"] = amount
 
-    for name in raw:
-        if name.startswith("q") and name[1:].isdigit():
-            out[name] = np.maximum(0.0, raw[name])
-    qcols = sorted((c for c in out.columns if c.startswith("q") and c[1:].isdigit()),
-                   key=lambda c: int(c[1:]))
-    if len(qcols) > 1:
-        out[qcols] = np.sort(out[qcols].to_numpy(), axis=1)
-
     if "point_l1" in raw:
         out["point_l1"] = np.maximum(0.0, raw["point_l1"])
+    return out
+
+
+# Prediction-cache schema shared by scripts/build_oof_preds.py and
+# train_postprocessor.py --dump-preds: the metadata a decision-layer
+# experiment needs (obs, lead, NBM for shared-row comparisons) plus every
+# head output the rare cascade reads. p-columns are the monotone
+# UNcalibrated probabilities (predict with calib=None) — the exact inputs
+# fit_calibration sees, so curves fit from a cache apply cleanly at
+# inference.
+CACHE_META_COLS = ["triplet", "valid_date", "lead_days", "obs_snowfall_in",
+                   "nbm_snowfall_cm"]
+CACHE_PRED_COLS = ["amount", "p1", "p2", "p6", "p12", "q80", "q90", "q95"]
+
+
+def dump_predictions(boosters: dict, df: pd.DataFrame, out_path: Path) -> pd.DataFrame:
+    """predict(calib=None) + cache metadata -> parquet at out_path."""
+    preds = predict(boosters, df, calib=None)
+    out = df[CACHE_META_COLS].reset_index(drop=True)
+    for c in CACHE_PRED_COLS:
+        if c in preds.columns:
+            out[c] = preds[c].to_numpy()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(out_path, index=False)
     return out
 
 
