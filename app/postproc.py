@@ -220,13 +220,15 @@ def build_features(pairs: pd.DataFrame, features: Optional[list[str]] = None) ->
     features = features or FEATURES
     df = pairs.copy()
     doy = pd.to_numeric(df.get("doy"), errors="coerce")
-    df["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)
-    df["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
+    df["doy_sin"] = np.sin(2 * np.pi * doy / 365.25).astype("float32")
+    df["doy_cos"] = np.cos(2 * np.pi * doy / 365.25).astype("float32")
     for c in features:
         if c in CATEGORICAL_FEATURES:
             df[c] = df.get(c, pd.Series(index=df.index, dtype=object)).astype("category")
         else:
-            df[c] = pd.to_numeric(df.get(c), errors="coerce")
+            # float32: LightGBM bins features anyway, and the full frame at
+            # float64 is ~2GB on 7M rows — past this 8GB machine's cliff.
+            df[c] = pd.to_numeric(df.get(c), errors="coerce").astype("float32")
     return df[features]
 
 
@@ -305,6 +307,15 @@ def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROU
         tw_params.pop("alpha", None)
         out["amount"] = lgb.train(tw_params, dset, num_boost_round=num_rounds)
 
+    # Diagnostic L1 head — kept so the scorecard can show the MAE-optimal
+    # model's CSI collapse next to the hurdle model. Not used in production.
+    # Trained BEFORE the exceedance heads: those swap the shared Dataset's
+    # labels, so every regression head must be done first.
+    if want("point_l1"):
+        l1_params = dict(LGB_PARAMS, objective="l1", metric="l1")
+        l1_params.pop("alpha", None)
+        out["point_l1"] = lgb.train(l1_params, dset, num_boost_round=num_rounds)
+
     # Exceedance heads: P(snowfall >= T) per operational threshold. Each is
     # isotonic-calibrated downstream (app/calibration.py), so what matters
     # here is ranking quality on the rare positives — hence scale_pos_weight.
@@ -312,25 +323,22 @@ def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROU
     for thr in EVENT_THRESHOLDS:
         if not want(_exc_key(thr)):
             continue
-        clf_label = (y.to_numpy() >= thr).astype(int)
-        pos = clf_label.sum()
+        clf_label = (y.to_numpy() >= thr).astype(float)
+        pos = int(clf_label.sum())
         if pos == 0 or pos == clf_label.size:
             continue                      # nothing to learn at this threshold
         spw = min((clf_label.size - pos) / pos, SPW_CAP)
-        cdset = lgb.Dataset(X, label=clf_label,
-                            categorical_feature=CATEGORICAL_FEATURES,
-                            free_raw_data=False)
+        # Reuse the ONE binned Dataset with swapped labels instead of
+        # constructing a fresh one per threshold: each Dataset is a full
+        # binned copy pinned by its Booster, and 4 extras OOM'd an 8GB
+        # machine. Boosters only need their train_set for CONTINUED
+        # training, never for prediction, so mutating labels afterwards is
+        # safe for our use.
+        dset.set_label(clf_label)
         clf_params = dict(LGB_PARAMS, objective="binary",
                           metric="binary_logloss", scale_pos_weight=spw)
         clf_params.pop("alpha", None)
-        out[_exc_key(thr)] = lgb.train(clf_params, cdset, num_boost_round=num_rounds)
-
-    # Diagnostic L1 head — kept so the scorecard can show the MAE-optimal
-    # model's CSI collapse next to the hurdle model. Not used in production.
-    if want("point_l1"):
-        l1_params = dict(LGB_PARAMS, objective="l1", metric="l1")
-        l1_params.pop("alpha", None)
-        out["point_l1"] = lgb.train(l1_params, dset, num_boost_round=num_rounds)
+        out[_exc_key(thr)] = lgb.train(clf_params, dset, num_boost_round=num_rounds)
     return out
 
 
