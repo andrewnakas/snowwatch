@@ -55,6 +55,81 @@ GATES = {
 }
 
 
+def check_release3(sample: list[dict]) -> list[str]:
+    """Release-3 feature parity: sources differ from the multimodel API, so
+    each gets its own check. Returns failed-check names (empty = ok).
+
+    * wind_uv — live Open-Meteo speed+direction -> u/v vs the training GFS
+      Zarr components (same model, different plumbing + time sampling:
+      hourly_6 live vs hourly archive), so loose gates;
+    * z500 / hrrr_native — the live path IS the training store (bulk Zarr
+      prefetch, scripts/fetch_live_upperair.py), so skew is structurally
+      impossible; the check is freshness + coverage of the cache.
+    """
+    from app.phase_features import live_phase_daily
+    failed = []
+    # upperair cache freshness/coverage
+    up_path = ROOT / "data" / "cache" / "live_upperair.json"
+    try:
+        up = json.loads(up_path.read_text())
+        age_h = (pd.Timestamp.now("UTC")
+                 - pd.Timestamp(up["created_utc"])).total_seconds() / 3600
+        n_z = sum(1 for v in up["stations"].values() if v.get("z500_by_valid"))
+        n_h = sum(1 for v in up["stations"].values() if v.get("hrrr_native_by_valid"))
+        print(f"  upperair cache: age {age_h:.1f}h, z500 {n_z}, hrrr {n_h} stations")
+        if age_h > 24 or n_z < 800:
+            failed.append("z500_upperair_cache")
+        if n_h < 700:   # CONUS-only (~835 in-domain)
+            failed.append("hrrr_native_upperair_cache")
+    except Exception as exc:
+        print(f"  upperair cache unreadable ({type(exc).__name__}) — run "
+              "scripts/fetch_live_upperair.py")
+        failed.append("upperair_cache_missing")
+    # u/v live vs training tree (gfs_wind) on today's overlap
+    rows = []
+    today = date.today().isoformat()
+    for st in sample[:6]:
+        tr = pd.DataFrame()
+        p = ROOT / "data" / "prevruns" / "gfs_wind" / f"{st['triplet'].replace(':', '_')}.csv.gz"
+        if p.exists():
+            tr = pd.read_csv(p, names=["valid_date", "lead_days",
+                                       "u10_mean_ms", "v10_mean_ms"],
+                             compression="gzip")
+            tr = tr[tr["valid_date"] >= today]
+        if tr.empty:
+            continue
+        live = live_phase_daily(met.fetch_phase_hourly(st["lat"], st["lon"], days=7))
+        if live.empty or live["u10_mean_ms"].isna().all():
+            continue
+        j = tr.merge(live[["valid_date", "u10_mean_ms", "v10_mean_ms"]],
+                     on="valid_date", suffixes=("_tr", "_lv"))
+        j["lead_live"] = (pd.to_datetime(j["valid_date"])
+                          - pd.Timestamp(today)).dt.days + 1
+        j = j[j["lead_days"] == j["lead_live"]]
+        rows.append(j)
+    if rows:
+        j = pd.concat(rows, ignore_index=True)
+        for c in ("u10_mean_ms", "v10_mean_ms"):
+            a = pd.to_numeric(j[f"{c}_tr"], errors="coerce")
+            b = pd.to_numeric(j[f"{c}_lv"], errors="coerce")
+            ok_rows = a.notna() & b.notna()
+            if ok_rows.sum() < 4:
+                continue
+            mad = float((a - b)[ok_rows].abs().mean())
+            r = float(np.corrcoef(a[ok_rows], b[ok_rows])[0, 1]) \
+                if ok_rows.sum() >= 8 else float("nan")
+            ok = mad <= 2.0 and (np.isnan(r) or r >= 0.6)
+            print(f"  {c:>14}: mean|Δ|={mad:.2f} (tol 2.0) r={r:.2f} "
+                  f"(min 0.6) n={int(ok_rows.sum())}  [{'ok' if ok else 'SKEW'}]")
+            if not ok:
+                failed.append(c)
+    else:
+        print("  wind_uv: no gfs_wind tree overlap for today — soft (nightly "
+              "zarr top-up hasn't covered today); u/v sign convention was "
+              "verified against the archive 2026-07-11")
+    return failed
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--stations", type=int, default=12)
@@ -121,6 +196,8 @@ def main() -> int:
             failed.append(feat)
         if args.verbose and not ok:
             print(g.sort_values("train", ascending=False).head(8).to_string())
+    print("release-3 feature checks:")
+    failed += check_release3(sample)
     if failed:
         print(f"FAILED: {failed} — do not release / do not enable postproc")
         return 1

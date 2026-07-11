@@ -76,10 +76,19 @@ def live_phase_daily(phase_hourly: pd.DataFrame) -> pd.DataFrame:
     if phase_hourly is None or phase_hourly.empty:
         return pd.DataFrame(columns=["valid_date", "wb_mean_c", "wb_min_c",
                                      "hours_wb_below_0"])
-    t_col = next((c for c in ("temperature_2m_gfs025", "temperature_2m")
-                  if c in phase_hourly.columns), None)
-    rh_col = next((c for c in ("relative_humidity_2m_gfs025", "relative_humidity_2m")
-                   if c in phase_hourly.columns), None)
+
+    def _pick(base: str):
+        """First candidate column that actually CARRIES data — the gfs025
+        alias has been observed all-null at the API while present in the
+        response, so existence alone is not enough."""
+        for suffix in ("_gfs025", "_gfs_global", ""):
+            c = base + suffix
+            if c in phase_hourly.columns and phase_hourly[c].notna().any():
+                return c
+        return None
+
+    t_col = _pick("temperature_2m")
+    rh_col = _pick("relative_humidity_2m")
     if t_col is None or rh_col is None:
         return pd.DataFrame(columns=["valid_date", "wb_mean_c", "wb_min_c",
                                      "hours_wb_below_0", "wind10_mean_ms"])
@@ -87,18 +96,37 @@ def live_phase_daily(phase_hourly: pd.DataFrame) -> pd.DataFrame:
                                   t_col=t_col, rh_col=rh_col, fl_col=None)
     # wind10: Open-Meteo serves speed directly (km/h) — convert to m/s to
     # match the training tree (|u,v| from the GFS archive).
-    w_col = next((c for c in ("wind_speed_10m_gfs025", "wind_speed_10m")
-                  if c in phase_hourly.columns), None)
+    w_col = _pick("wind_speed_10m")
+    d_col = _pick("wind_direction_10m")
     if w_col is not None:
         w = phase_hourly[["datetime", w_col]].copy()
         w["valid_date"] = pd.to_datetime(w["datetime"]).dt.strftime("%Y-%m-%d")
-        wind = (pd.to_numeric(w[w_col], errors="coerce") / 3.6).groupby(
-            w["valid_date"]).mean().rename("wind10_mean_ms").reset_index()
+        spd = pd.to_numeric(w[w_col], errors="coerce") / 3.6
+        wind = spd.groupby(w["valid_date"]).mean().rename(
+            "wind10_mean_ms").reset_index()
         out = out.merge(wind, on="valid_date", how="left")
-    else:
+        if d_col is not None:
+            # Signed components (release-3 wind_uv). Meteorological
+            # direction = degrees the wind blows FROM, so the eastward/
+            # northward components are u = -spd*sin(dir), v = -spd*cos(dir)
+            # — matching the GFS archive's earth-relative wind_u/v_10m
+            # (verified against the training tree on an overlap day, see
+            # scripts/check_feature_skew.py gates).
+            rad = np.deg2rad(pd.to_numeric(phase_hourly[d_col], errors="coerce"))
+            comp = pd.DataFrame({
+                "valid_date": w["valid_date"],
+                "u10_mean_ms": -spd * np.sin(rad),
+                "v10_mean_ms": -spd * np.cos(rad),
+            })
+            uv = comp.groupby("valid_date", as_index=False).mean()
+            out = out.merge(uv, on="valid_date", how="left")
+    if "wind10_mean_ms" not in out.columns:
         out["wind10_mean_ms"] = np.nan
+    for c in ("u10_mean_ms", "v10_mean_ms"):
+        if c not in out.columns:
+            out[c] = np.nan
     return out[["valid_date", "wb_mean_c", "wb_min_c", "hours_wb_below_0",
-                "wind10_mean_ms"]]
+                "wind10_mean_ms", "u10_mean_ms", "v10_mean_ms"]]
 
 
 def phase_frame_from_hourly(

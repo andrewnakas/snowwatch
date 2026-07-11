@@ -351,9 +351,18 @@ def fetch_profile(lat: float, lon: float, days: int = 7, *, max_age_hours: float
 
 # ---------- 2m phase variables (wet-bulb / freezing level, v1.6 Tier 1) -----
 
-PHASE_MODELS = "gfs025,ncep_nbm_conus"
+# gfs_global rides along as the GFS fallback: the gfs025 alias went
+# all-null at the API (observed 2026-07-11 — every field, every
+# resolution), which silently NaN'd the live phase features. Downstream
+# column choice is by data presence (phase_features._pick), so whichever
+# GFS alias actually carries values feeds the model.
+PHASE_MODELS = "gfs025,gfs_global,ncep_nbm_conus"
+# wind_direction_10m: with speed it yields the signed u/v components
+# (release-3 wind_uv group — upslope flow direction); rides the same
+# storm-gated fetch, so the training-side gate mirror still holds.
 PHASE_VARS = ("temperature_2m", "relative_humidity_2m",
-              "freezing_level_height", "wind_speed_10m")
+              "freezing_level_height", "wind_speed_10m",
+              "wind_direction_10m")
 
 
 def fetch_phase_hourly(lat: float, lon: float, days: int = 7, *,

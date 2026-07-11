@@ -91,6 +91,14 @@ jobs:
             echo "no models.tar.gz on the training-data Release; postproc member stays off"
           fi
 
+      - name: Prefetch upperair features (release-3)
+        # ONE bulk Zarr read per shard for GEFS z500 + HRRR native snowfall
+        # across all stations (~30s, zero Open-Meteo budget) — feeds the
+        # z500/hrrr_native feature groups via data/cache/live_upperair.json.
+        # Any failure keeps the previous cache; the postproc member
+        # NaN-routes absent features, so this can never break the build.
+        run: python scripts/fetch_live_upperair.py || echo "upperair prefetch failed; postproc degrades to NaN for those features"
+
       - name: Decide ensemble fetch window
         # Member-level ensemble pulls are the heaviest Open-Meteo calls; do
         # them on the 00Z and 12Z builds only. Other builds reuse the <=11h

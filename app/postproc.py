@@ -133,6 +133,7 @@ def build_inference_features(
     last_swe: Optional[float], issue_date, horizon: int,
     ens_fcst: Optional[pd.DataFrame] = None,
     phase_daily: Optional[pd.DataFrame] = None,
+    upperair: Optional[dict] = None,
 ) -> pd.DataFrame:
     """Pairs-shaped frame (one row per forecast day) from the live multimodel
     frame, mirroring scripts/build_training_data.py exactly — any drift
@@ -141,9 +142,12 @@ def build_inference_features(
     mm_fcst columns are `{model}_{snowfall|precip|tmean}` (app/met.py);
     training columns are `{model}_{snowfall_cm|precip_mm|tmean_c}`.
     ens_fcst: live ensemble stats (met.fetch_ensemble), mapped via
-    ENS_LIVE_TO_TRAIN. phase_daily: daily wet-bulb aggregates keyed by
-    valid_date (met.fetch_phase_hourly → phase_features). Absent sources
-    leave their columns NaN — LightGBM routes them natively.
+    ENS_LIVE_TO_TRAIN. phase_daily: daily wet-bulb (+ u/v wind) aggregates
+    keyed by valid_date (met.fetch_phase_hourly → phase_features).
+    upperair: this station's entry from the bulk Zarr prefetch
+    (scripts/fetch_live_upperair.py) — {"z500": {"<lead>": m},
+    "hrrr_native_snowfall_cm": cm}. Absent sources leave their columns
+    NaN — LightGBM routes them natively.
     """
     rows = []
     for _, r in (mm_fcst if mm_fcst is not None else pd.DataFrame()).iterrows():
@@ -194,7 +198,9 @@ def build_inference_features(
             e[keep], on="valid_date", how="left")
     if phase_daily is not None and not phase_daily.empty:
         p = phase_daily.copy()
-        pcols = [c for c in FEATURE_GROUPS["phase"] if c in p.columns]
+        # wind_uv rides the phase fetch and shares its storm gate.
+        pcols = [c for c in FEATURE_GROUPS["phase"] + FEATURE_GROUPS["wind_uv"]
+                 if c in p.columns]
         df = df.drop(columns=pcols).merge(
             p[["valid_date"] + pcols], on="valid_date", how="left")
         # Gate mirror of build_training_data.py: phase features exist only
@@ -202,6 +208,19 @@ def build_inference_features(
         from .phase_features import storm_gate
         gated_off = ~storm_gate(df.get("mm_precip_mean_mm")).to_numpy()
         df.loc[gated_off, pcols] = np.nan
+    if upperair:
+        # Valid-date-keyed maps sidestep init/lead ambiguity when the
+        # prefetch ran on an older init than this build's issue date.
+        z = upperair.get("z500_by_valid") or {}
+        df["z500_mean_m"] = pd.to_numeric(
+            df["valid_date"].map(z), errors="coerce")
+        hn = upperair.get("hrrr_native_by_valid") or {}
+        if hn:
+            # training tree covers lead 1 only (HRRR horizon): fill only
+            # lead-1 rows, matching the (valid_date, lead_days) train join.
+            lead1 = df["lead_days"] == 1
+            df.loc[lead1, "hrrr_native_snowfall_cm"] = pd.to_numeric(
+                df.loc[lead1, "valid_date"].map(hn), errors="coerce")
     return df
 
 
