@@ -44,6 +44,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 import time
 from pathlib import Path
@@ -113,8 +114,21 @@ def main() -> int:
     else:
         fold = FOLDS[args.fold]
 
-    pairs = pd.read_csv(args.pairs, compression="gzip")
+    # Memory diet: the production job (6.4M-row inner-train) got OOM-killed
+    # twice with the full frame. Read only the columns training/dumping
+    # reads and hold numerics as float32 (LightGBM bins to float32 anyway);
+    # ~halves resident memory.
+    wanted = set(postproc.FEATURES + ["doy", "triplet", "valid_date", "lead_days",
+                                      "obs_snowfall_in", "nbm_snowfall_cm",
+                                      "quality"])
+    pairs = pd.read_csv(args.pairs, compression="gzip",
+                        usecols=lambda c: c in wanted)
     pairs = postproc.usable_rows(pairs)
+    for c in pairs.columns:
+        if c in postproc.NUMERIC_FEATURES or c in (
+                "doy", "lead_days", "obs_snowfall_in", "nbm_snowfall_cm"):
+            pairs[c] = pd.to_numeric(pairs[c], errors="coerce").astype("float32")
+    gc.collect()
     print(f"{len(pairs)} usable pairs, {pairs['triplet'].nunique()} stations",
           flush=True)
 
@@ -157,6 +171,8 @@ def main() -> int:
         boosters = postproc.train(fit_df, feature_groups=groups, heads=HEADS)
         for target_df, path in targets:
             dump_preds(boosters, target_df, path)
+        del boosters
+        gc.collect()
         print(f"[done] {name} in {(time.time() - t0) / 60:.1f} min", flush=True)
     print(f"all jobs complete -> {out_dir}", flush=True)
     return 0
