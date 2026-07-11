@@ -47,16 +47,24 @@ BASE_FEATURES = [
     "elevation_ft", "lat", "lon", "median_slr",
     "obs_depth_issue_in", "obs_swe_issue_in",
 ]
-# Phase-3 groups, ablatable via train(feature_groups=...). z500_mean_m and
-# ens_n_members are deliberately EXCLUDED until the live source matches the
-# training source (GEFS-only reduction; z500 has no live feed yet) and
-# check_feature_skew clears them — see plan, train/serve skew rule.
+# Phase-3 + release-3 groups, ablatable via train(feature_groups=...).
+# ens_n_members stays EXCLUDED (live ensemble mixes GEFS+AIFS ~80 members,
+# training is GEFS-only 31). z500/wind_uv/hrrr_native live sources are the
+# release-3 upperair prefetch (scripts/fetch_live_upperair.py, bulk Zarr
+# read) and the storm-gated phase fetch + wind_direction_10m — a group only
+# ships once its live feed exists AND check_feature_skew clears it.
 FEATURE_GROUPS = {
     "ens": ["ens_snow_mean_cm", "ens_snow_std_cm", "ens_snow_p10_cm",
             "ens_snow_p50_cm", "ens_snow_p90_cm", "ens_prob_pos",
             "ens_precip_mean_mm", "ens_precip_std_mm"],
     "phase": ["wb_mean_c", "wb_min_c", "hours_wb_below_0", "wind10_mean_ms"],
     "hrrr_native": ["hrrr_native_snowfall_cm"],
+    # GEFS ensemble-mean 500hPa height: synoptic regime (trough/ridge).
+    "z500": ["z500_mean_m"],
+    # Signed 10m wind components (GFS, storm-gated like phase): upslope
+    # flow direction — trees learn per-station favorable directions via
+    # (u, v) x (lat, lon).
+    "wind_uv": ["u10_mean_ms", "v10_mean_ms"],
 }
 NUMERIC_FEATURES = BASE_FEATURES + [c for g in FEATURE_GROUPS.values() for c in g]
 CATEGORICAL_FEATURES = ["snow_class", "nbm_version"]
@@ -85,6 +93,16 @@ LGB_PARAMS = {
     "verbosity": -1,
 }
 NUM_ROUNDS = 600
+# Upper-tail quantiles get more capacity: they drive the rare-event
+# quantile floors (qfloor) and the smooth defaults blur exactly the tail
+# the floors read. Screened 2026-07-10 (head_screen_results.json): these
+# params lift the in-band oracle CSI@6 of a single q95 rule from 0.208
+# to 0.215 on fold-A shared rows. Lower quantiles keep the smooth
+# defaults — they only feed CRPS, where smoothness helps.
+TAIL_QUANTILE_MIN = 0.8
+TAIL_QUANTILE_PARAMS = {"num_leaves": 127, "min_data_in_leaf": 50,
+                        "learning_rate": 0.03}
+TAIL_QUANTILE_ROUNDS = 1500
 
 
 def nbm_version_for(d: str) -> str:
@@ -272,8 +290,13 @@ def train(pairs: pd.DataFrame, *, quantiles=QUANTILES, num_rounds: int = NUM_ROU
     for q in quantiles:
         if not want(f"q{int(q * 100)}"):
             continue
-        params = dict(LGB_PARAMS, alpha=q)
-        out[f"q{int(q * 100)}"] = lgb.train(params, dset, num_boost_round=num_rounds)
+        if q >= TAIL_QUANTILE_MIN:
+            params = dict(LGB_PARAMS, alpha=q, **TAIL_QUANTILE_PARAMS)
+            rounds = TAIL_QUANTILE_ROUNDS
+        else:
+            params = dict(LGB_PARAMS, alpha=q)
+            rounds = num_rounds
+        out[f"q{int(q * 100)}"] = lgb.train(params, dset, num_boost_round=rounds)
 
     # Amount head: Tweedie regressor (handles the zero-inflated tail).
     if want("amount"):

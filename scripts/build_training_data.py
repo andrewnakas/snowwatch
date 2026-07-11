@@ -56,6 +56,10 @@ GEFS_ENS_COLS = ["ens_snow_mean_cm", "ens_snow_std_cm", "ens_snow_p10_cm",
                  "ens_precip_mean_mm", "ens_precip_std_mm", "ens_n_members",
                  "z500_mean_m"]
 GFS_PHASE_COLS = ["wb_mean_c", "wb_min_c", "hours_wb_below_0", "wind10_mean_ms"]
+# gfs_wind — signed 10m u/v daily means (backfill_gfs_wind_zarr.py), the
+# upslope-flow direction predictor. Storm-gated like the phase columns:
+# the live source is the same gated fetch_phase_hourly call.
+GFS_WIND_COLS = ["u10_mean_ms", "v10_mean_ms"]
 
 
 def _read_aux_tree(tree: str, triplet: str, cols: list[str]) -> pd.DataFrame:
@@ -129,6 +133,13 @@ def build_station(st: dict, *, hist_days: int = HIST_DAYS) -> pd.DataFrame | Non
         from app.phase_features import storm_gate
         gated_off = ~storm_gate(fc.get("mm_precip_mean_mm")).to_numpy()
         fc.loc[gated_off, GFS_PHASE_COLS] = np.nan
+    wd = _read_aux_tree("gfs_wind", triplet, GFS_WIND_COLS)
+    if not wd.empty:
+        fc = fc.merge(wd, on=["valid_date", "lead_days"], how="left")
+        # Same gate as phase — u/v ride the same live fetch.
+        from app.phase_features import storm_gate
+        gated_off = ~storm_gate(fc.get("mm_precip_mean_mm")).to_numpy()
+        fc.loc[gated_off, GFS_WIND_COLS] = np.nan
 
     # Targets: QC'd daily snowfall + antecedent state.
     end = date.today()
