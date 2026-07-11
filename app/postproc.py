@@ -91,6 +91,11 @@ LGB_PARAMS = {
     "bagging_freq": 1,
     "lambda_l2": 1.0,
     "verbosity": -1,
+    # The heads share ONE binned Dataset (memory) with differing
+    # min_data_in_leaf (tail quantiles use 50, the rest 200); LightGBM
+    # pre-filters features at construction using the first value and
+    # fatals when a later train lowers it — disable the pre-filter.
+    "feature_pre_filter": False,
 }
 NUM_ROUNDS = 600
 # Upper-tail quantiles get more capacity: they drive the rare-event
@@ -376,15 +381,25 @@ def predict(boosters: dict, pairs: pd.DataFrame, *, calib: Optional[dict] = None
     without it (or with pre-v1.6 saved models) the legacy 1in hurdle applies,
     so old model dirs keep producing exactly what they used to.
     """
-    # Feature list comes from the boosters themselves (LightGBM stores it):
-    # a model trained on an ablated / older feature set predicts correctly
-    # regardless of what this module's FEATURES currently says.
-    try:
-        feats = next(iter(boosters.values())).feature_name()
-    except AttributeError:   # test fakes / stubs without feature_name()
-        feats = None
-    X = build_features(pairs, feats if feats else None)
-    raw = {name: bst.predict(X) for name, bst in boosters.items()}
+    # Feature lists come from the boosters themselves (LightGBM stores
+    # them): a model trained on an ablated / older feature set predicts
+    # correctly regardless of what this module's FEATURES currently says.
+    # PER-SIGNATURE frames: a mixed-era model dir (e.g. a stale legacy
+    # booster next to current heads) must not feed one booster another's
+    # feature layout — that mismatch killed every station in production
+    # (2026-07-11) when a single shared frame was used.
+    sigs: dict = {}
+    for name, bst in boosters.items():
+        try:
+            key = tuple(bst.feature_name())
+        except AttributeError:   # test fakes / stubs without feature_name()
+            key = None
+        sigs.setdefault(key, []).append(name)
+    raw = {}
+    for key, names in sigs.items():
+        Xk = build_features(pairs, list(key) if key else None)
+        for name in names:
+            raw[name] = boosters[name].predict(Xk)
     out = pd.DataFrame(index=pairs.index)
 
     amount = np.maximum(0.0, raw.get("amount", raw.get("point", np.zeros(len(pairs)))))
@@ -492,6 +507,13 @@ def dump_predictions(boosters: dict, df: pd.DataFrame, out_path: Path) -> pd.Dat
 
 def save(boosters: dict, *, models_dir: Path = MODELS_DIR, meta: Optional[dict] = None) -> None:
     models_dir.mkdir(parents=True, exist_ok=True)
+    # Clear stale boosters first: a leftover file from an older training
+    # (different feature set) rides the release tar and load() picks it up
+    # — legacy 29-feature point/psnow files shipped alongside 41-feature
+    # heads took the whole postproc member down in production (2026-07-11,
+    # every station "number of features ... not the same").
+    for old in models_dir.glob("postproc_*.txt"):
+        old.unlink()
     for name, bst in boosters.items():
         bst.save_model(str(models_dir / f"postproc_{name}.txt"))
     if meta is not None:

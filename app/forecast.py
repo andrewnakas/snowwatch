@@ -1052,9 +1052,17 @@ def forecast_station(
     if nbm_pred:
         members_raw["nbm_snowfall"] = nbm_pred
 
-    pp_pred, pp_daily = _member_postproc_snowfall(
-        last_depth, last_swe, mm_fcst, station, hist_qc, today=today,
-        horizon=horizon, ens_fcst=ens_fcst)
+    # A postproc failure must degrade to "member absent", never take the
+    # station down: a stale booster in the restored models dir crashed
+    # every station build in production (2026-07-11).
+    try:
+        pp_pred, pp_daily = _member_postproc_snowfall(
+            last_depth, last_swe, mm_fcst, station, hist_qc, today=today,
+            horizon=horizon, ens_fcst=ens_fcst)
+    except Exception as exc:
+        print(f"postproc member failed ({type(exc).__name__}: {str(exc)[:120]}) "
+              f"— continuing without it")
+        pp_pred, pp_daily = [], []
     if pp_pred:
         members_raw["postproc_snowfall"] = pp_pred
 
