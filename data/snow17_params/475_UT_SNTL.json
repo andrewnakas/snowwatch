@@ -1,0 +1,1 @@
+{"triplet":"475:UT:SNTL","fitted_at":1783940300.5611193,"n_rows":700,"first_date":"2024-08-12","last_date":"2026-07-12","base_params":{"MFMAX":1.05,"MFMIN":0.6,"UADJ":0.04,"PXTEMP":1.0},"params":{"MFMAX":1.3685188757409965,"MFMIN":0.05,"UADJ":0.04,"PXTEMP":3.0},"loss_base":12.177607370732328,"loss_fit":11.47341279067368}
